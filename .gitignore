@@ -1,0 +1,34 @@
+# Docker image tarball (9.8 GB — never commit)
+vllm-omni-xpu-v0240.tar.gz
+*.tar.gz
+*.tar
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Binary data artifacts (regenerable POC outputs — kept out of git)
+*.pt
+*.pth
+*.npz
+*.npy
+*.json.gz
+
+# Result / profiling data (code + docs only — outputs stay out of git)
+*.json
+*.txt
+
+# Media
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+
+# Common noise
+.DS_Store
+*.log
+.ipynb_checkpoints/
+.venv/
+venv/
