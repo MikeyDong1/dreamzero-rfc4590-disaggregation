@@ -32,6 +32,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: Canonical dotted path to :func:`diffusion_stage_transition`, co-located with
+#: the function it names so a pipeline wiring the generic processor references one
+#: source of truth instead of hand-copying the string. Declared as a literal (not
+#: derived from ``__name__``) because the torch-free foundation tests load this
+#: module by file path under a synthetic name (see conftest.py), which would make
+#: any ``__name__``-derived path wrong.
+GENERIC_DIFFUSION_PROCESSOR = (
+    "vllm_omni.model_executor.stage_input_processors.diffusion.diffusion_stage_transition"
+)
+
+# STAGE_PAYLOAD_*_KEY: canonical definitions live in
+# ``vllm_omni.diffusion.stage_payload`` (the torch-free transport leaf). They are
+# re-declared here as literals — not imported — on purpose: this processor is
+# loaded by file path in the torch-free foundation tests (see
+# tests/diffusion/disaggregated/conftest.py), and a top-level ``from vllm_omni...``
+# import would trigger the package ``__init__`` (and torch). ``test_payload_key_sync``
+# asserts these literals stay equal to the canonical constants so the copies cannot drift.
+
 #: Key under which a stage's ``DiffusionOutput.custom_output`` carries the
 #: outgoing :class:`DiffusionStagePayload`.
 STAGE_PAYLOAD_OUTPUT_KEY = "__diffusion_stage_payload__"

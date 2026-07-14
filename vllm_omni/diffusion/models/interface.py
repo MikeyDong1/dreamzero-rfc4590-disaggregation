@@ -1,5 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Diffusion pipeline capability protocols and their feature-probe helpers.
+
+Home of the ``runtime_checkable`` protocols the diffusion runtime uses to decide
+what a loaded pipeline can do, plus the ``supports_*`` helpers that isinstance-probe
+them: input/output modality markers, :class:`SupportsStepExecution` (the four-method
+step contract), :class:`SupportsDiffusionAtoms` (finer encode/decode atoms),
+:class:`SupportsComponentDiscovery` (submodule locations for offload/HSDP), and
+:class:`SupportsDisaggregatedDiffusionExecution` (the RFC #4590 encode/denoise/decode
+payload hooks). Kept torch-free at module scope (torch imports are TYPE_CHECKING-only)
+so capability checks stay importable without the model runtime.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass

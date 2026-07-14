@@ -21,8 +21,10 @@ from vllm_omni.config.stage_config import (
 
 #: Dotted path to the generic diffusion -> diffusion transition processor. One
 #: model-agnostic adapter for every disaggregated diffusion model (RFC #4590 §6).
-GENERIC_DIFFUSION_PROCESSOR = (
-    "vllm_omni.model_executor.stage_input_processors.diffusion.diffusion_stage_transition"
+#: Re-exported from the processor module (its single source of truth) so this
+#: topology and the function it names cannot drift.
+from vllm_omni.model_executor.stage_input_processors.diffusion import (  # noqa: E402
+    GENERIC_DIFFUSION_PROCESSOR,
 )
 
 DREAMZERO_PIPELINE = PipelineConfig(

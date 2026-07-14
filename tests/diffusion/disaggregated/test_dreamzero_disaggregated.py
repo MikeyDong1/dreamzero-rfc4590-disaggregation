@@ -123,7 +123,7 @@ def _make_encode_state_with_carrier():
 def test_export_encode_to_denoise_payload_shape_dtype():
     # export_stage_payload is an instance method but only touches state.extra;
     # bind it unbound to avoid constructing the (checkpoint-heavy) pipeline.
-    state, carrier = _make_encode_state_with_carrier()
+    state, _ = _make_encode_state_with_carrier()
     payload = DreamZeroPipeline.export_stage_payload(
         _StubPipeline(), state, source_stage=ENCODE, target_stage=DENOISE
     )

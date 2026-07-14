@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZERO_SESSIONS
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_payload import STAGE_PAYLOAD_PROMPT_KEY
 from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.platforms import current_omni_platform
@@ -141,9 +142,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
     def _infer_frame_seqlen(self) -> int:
         """frame_seqlen = (H//8)*(W//8)//4 from the configured image_resolution."""
-        mc = getattr(self.od_config, "model_config", None) or {}
-        psc = (mc.get("policy_server_config") if isinstance(mc, dict) else None) or {}
-        res = psc.get("image_resolution", [180, 320])
+        res = self._image_resolution()
         h, w = int(res[0]), int(res[1])
         return (h // 8) * (w // 8) // 4
 
@@ -169,8 +168,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # The loaded transformer is the source of truth for frame_seqlen (it derives
         # max_attention_size from it). The deploy-config inference is only a
         # cross-check — warn on drift rather than silently sizing chunks wrong.
-        frame_seqlen = int(getattr(t, "frame_seqlen", 0)) or self._infer_frame_seqlen()
         inferred = self._infer_frame_seqlen()
+        frame_seqlen = int(getattr(t, "frame_seqlen", 0)) or inferred
         if frame_seqlen != inferred:
             logger.warning(
                 "AR-Diffusion frame_seqlen mismatch: transformer=%d deploy-config=%d; using transformer",
@@ -250,7 +249,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if session_id is None and self.model_stage == DENOISE:
             prompt = req.prompt
             extra = prompt.get("extra") if isinstance(prompt, dict) else getattr(prompt, "extra", None)
-            payload = extra.get("diffusion_stage_payload") if isinstance(extra, dict) else None
+            payload = extra.get(STAGE_PAYLOAD_PROMPT_KEY) if isinstance(extra, dict) else None
             if payload is not None:
                 session_id = getattr(payload, "metadata", {}).get("session_id")
         return str(session_id or "default")
@@ -395,7 +394,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 n_frames = 1 if i == 0 else 4  # client convention: 1-frame prefill, 4-frame chunks
                 obs = self._synth_robot_obs(h, w, n_frames)
                 sp = OmniDiffusionSamplingParams(extra_args={"reset": i == 0, "session_id": sid, "robot_obs": obs})
-                req = OmniDiffusionRequest(prompts=["warmup"], sampling_params=sp, request_id=f"ardiffusion-warmup-{i}")
+                req = OmniDiffusionRequest(prompt="warmup", sampling_params=sp, request_id=f"ardiffusion-warmup-{i}")
                 self.execute_model(req)
                 # Stop once the resident window is full — the remaining shapes are
                 # already captured (the window caps/resets through the same set).

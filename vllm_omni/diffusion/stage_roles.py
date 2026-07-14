@@ -57,8 +57,10 @@ def normalize_stage_role(model_stage: str | None) -> str:
     """Return a canonical role string for a raw ``model_stage`` value.
 
     ``None`` and the empty string collapse to :data:`MONOLITHIC`; every other
-    value is returned verbatim (lower-cased and stripped) so unknown roles are
-    preserved for model-declared extensions rather than silently rewritten.
+    value is returned verbatim after stripping surrounding whitespace (case is
+    preserved) so unknown roles stay intact for model-declared extensions rather
+    than being silently rewritten. Role matching against the built-in constants
+    is therefore case-sensitive.
     """
     if model_stage is None:
         return MONOLITHIC
@@ -149,10 +151,11 @@ class StageComponentSpec:
         return bool(getattr(self, component, False))
 
     def union(self, other: StageComponentSpec) -> StageComponentSpec:
-        """Return a spec requiring every component either spec requires.
+        """Return a spec requiring every component either spec requires (per-field OR).
 
-        Used by the monolithic fallback, which owns the whole pipeline: the
-        union of all per-stage specs.
+        Useful for composing a superset spec from per-stage specs (e.g. a
+        "build everything" spec for a monolithic worker). The built-in monolithic
+        path instead returns the :data:`ALL_COMPONENTS` singleton directly.
         """
         return StageComponentSpec(
             **{f.name: (getattr(self, f.name) or getattr(other, f.name)) for f in fields(self)}

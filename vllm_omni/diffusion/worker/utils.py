@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -60,8 +62,6 @@ def run_encode_atoms(pipeline: Any, state: DiffusionRequestState) -> DiffusionRe
     ``prepare_encode`` one-shot. Either way the (possibly mutated) state is
     returned so callers do not depend on in-place vs return semantics.
     """
-    from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
-
     if supports_diffusion_atoms(pipeline):
         state = pipeline.check_inputs(state) or state
         state = pipeline.encode_conditions(state) or state
@@ -78,8 +78,6 @@ def run_decode_atoms(pipeline: Any, state: DiffusionRequestState) -> DiffusionOu
     Mirror of :func:`run_encode_atoms`: prefer ``decode_latents ->
     postprocess_outputs`` when available, else fall back to ``post_decode``.
     """
-    from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
-
     if supports_diffusion_atoms(pipeline):
         state = pipeline.decode_latents(state) or state
         return pipeline.postprocess_outputs(state)

@@ -42,6 +42,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: payloads whose ``schema_version`` they do not understand.
 DIFFUSION_STAGE_PAYLOAD_SCHEMA_VERSION = 1
 
+#: The two channels a :class:`DiffusionStagePayload` travels between stages, kept
+#: here (the torch-free transport leaf every stage layer already imports) as the
+#: single source of truth so the runner, the generic transition processor, and
+#: the AR-Diffusion runner cannot drift:
+#:
+#: * :data:`STAGE_PAYLOAD_OUTPUT_KEY` — key under which the *producer* stage's
+#:   ``DiffusionOutput.custom_output`` carries the outgoing payload.
+#: * :data:`STAGE_PAYLOAD_PROMPT_KEY` — key under which the *consumer* stage's
+#:   request prompt ``extra`` dict carries the incoming payload.
+STAGE_PAYLOAD_OUTPUT_KEY = "__diffusion_stage_payload__"
+STAGE_PAYLOAD_PROMPT_KEY = "diffusion_stage_payload"
+
 #: Metadata values are restricted to these plain, transportable Python types
 #: (recursively for containers). Everything else is rejected at validation.
 #: ``bytes`` is allowed for opaque model-private blobs; numpy scalars/arrays are
@@ -206,9 +218,11 @@ class DiffusionStagePayload:
 
         The inter-stage IPC (msgpack) does not preserve dataclass identity, so a
         payload sent through ``custom_output`` arrives on the receiving stage as
-        a plain ``dict`` with the same keys as this dataclass's fields. Callers
-        (:func:`_unwrap_stage_payload`) reconstruct the real type via this
-        method before calling :meth:`validate`.
+        a plain ``dict`` with the same keys as this dataclass's fields. Two
+        callers reconstruct the real type via this method before validation: the
+        processor's ``_unwrap_stage_payload`` (whose caller then validates) and
+        the runner's ``DiffusionModelRunner._extract_incoming_payload`` (which
+        validates the result directly).
         """
         return cls(
             schema_version=data["schema_version"],

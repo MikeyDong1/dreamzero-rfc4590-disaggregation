@@ -12,7 +12,7 @@ import copy
 import json
 import logging
 import os
-import re as re_module
+import re
 from collections import OrderedDict
 from collections.abc import Iterable
 
@@ -57,6 +57,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.stage_payload import DiffusionStagePayload, StagePayloadError
 from vllm_omni.diffusion.stage_roles import (
+    ALL_COMPONENTS,
     DECODE,
     DENOISE,
     ENCODE,
@@ -71,7 +72,7 @@ logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
 
 
-def _WAN_VAE_LATENTS_MEAN_STD() -> tuple[list[float], list[float]]:
+def _wan_vae_latents_mean_std() -> tuple[list[float], list[float]]:
     """Wan 2.1 VAE (16-channel) latent normalization constants.
 
     Mirrors ``AutoencoderKLWan.config.latents_mean`` / ``latents_std``. Used only
@@ -163,6 +164,26 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """Cross-attn cache from the engine pool (text k/v + I2V image k_img/v_img)."""
         return self._ar_diffusion_kv_state.get_cross_kv_caches(is_negative)
 
+    @staticmethod
+    def _layerwise_offload_hook(block):
+        """Return the layerwise-offload hook attached to a DiT block, or None.
+
+        When layerwise CPU offload is active each block carries a HookRegistry
+        with a LayerwiseOffloadHook; the hook materializes/frees the block's
+        weights around its forward(). Code paths that use block weights outside
+        forward() (e.g. eager cross-attn KV population) must onload/offload via
+        this hook. Returns None when offload is not enabled.
+        """
+        registry = getattr(block, "_hook_registry", None)
+        if registry is None:
+            return None
+        try:
+            from vllm_omni.diffusion.offloader.layerwise_backend import LayerwiseOffloadHook
+
+            return registry._hooks.get(LayerwiseOffloadHook._HOOK_NAME)
+        except Exception:
+            return None
+
     def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
         """Eagerly project cross-attn K/V for all layers into the AR-Diffusion pool.
 
@@ -186,17 +207,31 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         projected = self.transformer.text_embedding(context) if need_text else None
         img_ctx = self.transformer.img_emb(clip_feature) if need_img else None
         for i, block in enumerate(self.transformer.blocks):
-            ca = block.cross_attn
-            n, d = ca.tp_num_heads, ca.head_dim
-            k = v = None
-            if projected is not None:
-                k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
-                v = ca.v(projected).unflatten(2, (n, d))
-            k_img = v_img = None
-            if img_ctx is not None:
-                k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
-                v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
-            s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
+            # Layerwise-offload compatibility: this eager cross-KV precompute reaches
+            # into block.cross_attn.{k,v,...} WITHOUT calling block.forward(), so the
+            # offload pre_forward/post_forward hooks (which materialize block weights
+            # on device and free them after) never fire and the projection weights
+            # stay as CPU/empty placeholders -> "mat1 on xpu, weight on cpu" addmm
+            # error. Mirror the hook's self-heal path: materialize this block before
+            # use and offload it after. No-op when offload is disabled (no hook).
+            _off_hook = self._layerwise_offload_hook(block)
+            if _off_hook is not None and not _off_hook.is_materialized and _off_hook._prev_hook is not None:
+                _off_hook._prev_hook.prefetch_layer(non_blocking=False)
+            try:
+                ca = block.cross_attn
+                n, d = ca.tp_num_heads, ca.head_dim
+                k = v = None
+                if projected is not None:
+                    k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
+                    v = ca.v(projected).unflatten(2, (n, d))
+                k_img = v_img = None
+                if img_ctx is not None:
+                    k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
+                    v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
+                s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
+            finally:
+                if _off_hook is not None:
+                    _off_hook.offload_layer()
         if need_text:
             s._cross_text_populated[is_negative] = True
         if need_img:
@@ -364,7 +399,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             # Wan 2.1 VAE latent normalization constants (16 channels). Needed by
             # encode/decode math; carried here so the denoise stage's buffers
             # exist even without the VAE module (they are simply unused there).
-            latents_mean, latents_std = _WAN_VAE_LATENTS_MEAN_STD()
+            latents_mean, latents_std = _wan_vae_latents_mean_std()
         self.register_buffer(
             "vae_latents_mean",
             torch.tensor(latents_mean, dtype=torch.float32).view(1, -1, 1, 1, 1),
@@ -690,8 +725,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     dtype=self.vae.dtype,
                     device=device,
                 )
-                mean = self.vae_latents_mean.to(device=device, dtype=self.vae.dtype)
-                inv_std = self.vae_latents_inv_std.to(device=device, dtype=self.vae.dtype)
+                mean, inv_std = self._vae_latents_mean_inv_std(device=device, dtype=self.vae.dtype)
                 dummy_latent_denorm = dummy_latent / inv_std + mean
                 self._cudagraph_mark_step_begin()
                 self.vae.decode(dummy_latent_denorm, return_dict=False)
@@ -869,11 +903,24 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         return out, self._vae_clone_feat_map(self.vae._enc_feat_map)
 
+    def _vae_latents_mean_inv_std(
+        self, *, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the (mean, inv_std) VAE-latent normalization buffers on a target device/dtype.
+
+        Single accessor for the ``vae_latents_mean`` / ``vae_latents_inv_std``
+        registered buffers so the (de)normalization sites don't each hand-cast
+        both buffers.
+        """
+        return (
+            self.vae_latents_mean.to(device=device, dtype=dtype),
+            self.vae_latents_inv_std.to(device=device, dtype=dtype),
+        )
+
     def _vae_quantize_encoder_out(self, encoder_out: torch.Tensor) -> torch.Tensor:
         enc = self.vae.quant_conv(encoder_out)
         mu, _ = enc.chunk(2, dim=1)
-        mean = self.vae_latents_mean.to(device=mu.device, dtype=mu.dtype)
-        inv_std = self.vae_latents_inv_std.to(device=mu.device, dtype=mu.dtype)
+        mean, inv_std = self._vae_latents_mean_inv_std(device=mu.device, dtype=mu.dtype)
         return (mu - mean) * inv_std
 
     def _vae_stream_seed(self, state: DreamZeroState, first_frame: torch.Tensor) -> None:
@@ -964,8 +1011,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._cudagraph_mark_step_begin()
         hidden = self.vae._encode(videos.to(dtype=self.vae.dtype))
         mu, _ = hidden.chunk(2, dim=1)
-        mean = self.vae_latents_mean.to(device=mu.device, dtype=mu.dtype)
-        inv_std = self.vae_latents_inv_std.to(device=mu.device, dtype=mu.dtype)
+        mean, inv_std = self._vae_latents_mean_inv_std(device=mu.device, dtype=mu.dtype)
         mu = (mu - mean) * inv_std
         return mu.to(dtype=input_dtype)
 
@@ -974,8 +1020,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         vae_dtype = self.vae.dtype
         vae_device = next(self.vae.parameters()).device
         latents = video_latents.to(device=vae_device, dtype=vae_dtype)
-        mean = self.vae_latents_mean.to(device=vae_device, dtype=vae_dtype)
-        inv_std = self.vae_latents_inv_std.to(device=vae_device, dtype=vae_dtype)
+        mean, inv_std = self._vae_latents_mean_inv_std(device=vae_device, dtype=vae_dtype)
         latents = latents / inv_std + mean
         with torch.no_grad():
             self._cudagraph_mark_step_begin()
@@ -1723,17 +1768,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
         if role == DECODE:
             return StageComponentSpec(vae_decoder=True)
-        # Monolithic / unknown: everything.
-        return StageComponentSpec(
-            tokenizer=True,
-            text_encoder=True,
-            image_encoder=True,
-            vae_encoder=True,
-            dit=True,
-            scheduler=True,
-            vae_decoder=True,
-            action_modules=True,
-        )
+        # Monolithic / unknown: everything. Reuse the shared all-True singleton so
+        # this stays in step with StageComponentSpec if a component is ever added.
+        return ALL_COMPONENTS
 
     # -- runner-facing atoms -------------------------------------------------
     # The runner's run_encode_atoms / run_decode_atoms compat shims prefer these
@@ -1957,16 +1994,24 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return self._parse_action_norm_stats(metadata)
 
     @staticmethod
-    def _parse_action_norm_stats(metadata: dict) -> dict[str, dict[str, torch.Tensor]]:
+    def _parse_norm_stats(metadata: dict, stats_kind: str) -> dict[str, dict[str, torch.Tensor]]:
+        """Parse per-embodiment q01/q99 normalization stats of one kind.
+
+        ``stats_kind`` selects the ``statistics`` sub-block ("action" or
+        "state"); the joint_position + gripper_position q01/q99 vectors are
+        concatenated into per-embodiment tensors. Shared by the action and state
+        parsers, which differ only in that key.
+
+        Returns: {embodiment_name: {"q01": Tensor(dim,), "q99": Tensor(dim,)}}
+        """
         result = {}
         for emb_name, emb_data in metadata.items():
-            action_stats = emb_data.get("statistics", {}).get("action", {})
+            stats = emb_data.get("statistics", {}).get(stats_kind, {})
             q01_parts, q99_parts = [], []
-            # Concatenate joint_position + gripper_position stats
             for key in ["joint_position", "gripper_position"]:
-                if key in action_stats:
-                    q01_parts.extend(action_stats[key]["q01"])
-                    q99_parts.extend(action_stats[key]["q99"])
+                if key in stats:
+                    q01_parts.extend(stats[key]["q01"])
+                    q99_parts.extend(stats[key]["q99"])
             if q01_parts:
                 result[emb_name] = {
                     "q01": torch.tensor(q01_parts, dtype=torch.float32),
@@ -1975,22 +2020,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return result
 
     @staticmethod
+    def _parse_action_norm_stats(metadata: dict) -> dict[str, dict[str, torch.Tensor]]:
+        """Load per-embodiment action normalization stats from metadata.json."""
+        return DreamZeroPipeline._parse_norm_stats(metadata, "action")
+
+    @staticmethod
     def _parse_state_norm_stats(metadata: dict) -> dict[str, dict[str, torch.Tensor]]:
         """Load per-embodiment state normalization stats from metadata.json."""
-        result = {}
-        for emb_name, emb_data in metadata.items():
-            state_stats = emb_data.get("statistics", {}).get("state", {})
-            q01_parts, q99_parts = [], []
-            for key in ["joint_position", "gripper_position"]:
-                if key in state_stats:
-                    q01_parts.extend(state_stats[key]["q01"])
-                    q99_parts.extend(state_stats[key]["q99"])
-            if q01_parts:
-                result[emb_name] = {
-                    "q01": torch.tensor(q01_parts, dtype=torch.float32),
-                    "q99": torch.tensor(q99_parts, dtype=torch.float32),
-                }
-        return result
+        return DreamZeroPipeline._parse_norm_stats(metadata, "state")
 
     def _normalize_state(
         self,
@@ -2127,7 +2164,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if subkey == "norm.weight":
             return "encoder.final_layer_norm.weight"
 
-        m = re_module.match(r"blocks\.(\d+)\.(.*)", subkey)
+        m = re.match(r"blocks\.(\d+)\.(.*)", subkey)
         if not m:
             return None
         block_idx = m.group(1)
@@ -2203,7 +2240,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             "time_conv.bias": "time_conv.bias",
         }
 
-        m = re_module.match(r"encoder\.middle\.(\d+)\.(.*)", rest)
+        m = re.match(r"encoder\.middle\.(\d+)\.(.*)", rest)
         if m:
             idx = int(m.group(1))
             tail = m.group(2)
@@ -2214,7 +2251,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 return f"encoder.mid_block.attentions.0.{tail}"
             return None
 
-        m = re_module.match(r"decoder\.middle\.(\d+)\.(.*)", rest)
+        m = re.match(r"decoder\.middle\.(\d+)\.(.*)", rest)
         if m:
             idx = int(m.group(1))
             tail = m.group(2)
@@ -2225,7 +2262,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 return f"decoder.mid_block.attentions.0.{tail}"
             return None
 
-        m = re_module.match(r"encoder\.downsamples\.(\d+)\.(.*)", rest)
+        m = re.match(r"encoder\.downsamples\.(\d+)\.(.*)", rest)
         if m:
             idx = int(m.group(1))
             tail = m.group(2)
@@ -2233,7 +2270,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 return f"encoder.down_blocks.{idx}.{block_leaf_map[tail]}"
             return None
 
-        m = re_module.match(r"decoder\.upsamples\.(\d+)\.(.*)", rest)
+        m = re.match(r"decoder\.upsamples\.(\d+)\.(.*)", rest)
         if m:
             idx = int(m.group(1))
             tail = m.group(2)

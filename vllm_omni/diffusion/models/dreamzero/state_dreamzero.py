@@ -96,7 +96,7 @@ class DreamZeroState:
         - Created once in DreamZeroPipeline.__init__()
         - Mutated every forward() call (frame append, KV cache grow)
         - reset() on new session / language change
-        - reset_inference_state() on local_attn_size exceeded (KV only)
+        - reset(clear_video_latents=False) on local_attn_size exceeded (KV only)
     """
 
     def __init__(self) -> None:
@@ -170,7 +170,7 @@ class DreamZeroState:
         self.video_latents_across_time = []
 
     # ------------------------------------------------------------------
-    # Reset / should_reset
+    # Reset / reset_reason
     # ------------------------------------------------------------------
 
     def reset(self, *, clear_video_latents: bool = True) -> None:
@@ -206,10 +206,6 @@ class DreamZeroState:
         self.vae_encoder_out: torch.Tensor | None = None
         self.vae_pending_body_frames: torch.Tensor | None = None
 
-    def reset_inference_state(self) -> None:
-        """Reset KV/frame state after local attention rolls without dropping video latents."""
-        self.reset(clear_video_latents=False)
-
     def reset_reason(
         self,
         text_tokens: torch.Tensor | None,
@@ -241,7 +237,3 @@ class DreamZeroState:
             return "inference"
 
         return None
-
-    def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
-        """Determine if state should be reset before this forward()."""
-        return self.reset_reason(text_tokens, num_video_frames, local_attn_size) is not None

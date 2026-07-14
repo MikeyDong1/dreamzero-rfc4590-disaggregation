@@ -310,7 +310,6 @@ class DiffusionEngine:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
         custom_output = output.custom_output or {}
-        action_payload = None
         action_only_output = bool(custom_output.get("action_only_output"))
 
         postprocess_start_time = time.perf_counter()
@@ -333,14 +332,14 @@ class DiffusionEngine:
             action_payload = custom_output.get("actions")
             if action_payload is not None:
                 postprocess_output = replace(postprocess_output, action_payload=action_payload)
-        action_post_process_func = getattr(self, "action_post_process_func", None)
+        action_post_process_func = self.action_post_process_func
         if action_payload is None and action_post_process_func is not None:
             raw_action_payload = custom_output.get("action")
             if raw_action_payload is not None:
                 action_kwargs: dict[str, Any] = {}
-                if getattr(self, "_action_post_process_accepts_custom_output", False):
+                if self._action_post_process_accepts_custom_output:
                     action_kwargs["custom_output"] = custom_output
-                if getattr(self, "_action_post_process_accepts_sampling_params", False):
+                if self._action_post_process_accepts_sampling_params:
                     action_kwargs["sampling_params"] = request.sampling_params
                 action_payload = action_post_process_func(raw_action_payload, **action_kwargs)
                 custom_output = {**custom_output, "actions": action_payload}

@@ -40,7 +40,12 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-from vllm_omni.diffusion.stage_payload import DiffusionStagePayload, StagePayloadError
+from vllm_omni.diffusion.stage_payload import (
+    STAGE_PAYLOAD_OUTPUT_KEY,
+    STAGE_PAYLOAD_PROMPT_KEY,
+    DiffusionStagePayload,
+    StagePayloadError,
+)
 from vllm_omni.diffusion.stage_roles import (
     DECODE,
     DENOISE,
@@ -67,15 +72,6 @@ from vllm_omni.diffusion.worker.utils import (
     run_decode_atoms,
     run_encode_atoms,
 )
-
-#: custom_output key carrying the outgoing DiffusionStagePayload between diffusion
-#: stages. Mirrors stage_input_processors.diffusion.STAGE_PAYLOAD_OUTPUT_KEY (kept
-#: local to avoid importing the model_executor package into the worker).
-STAGE_PAYLOAD_OUTPUT_KEY = "__diffusion_stage_payload__"
-
-#: prompt ``extra`` key carrying the incoming DiffusionStagePayload for a
-#: downstream diffusion stage. Mirrors STAGE_PAYLOAD_PROMPT_KEY.
-STAGE_PAYLOAD_PROMPT_KEY = "diffusion_stage_payload"
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -431,14 +427,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
             self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
 
-        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            if req.sampling_params.generator_device is not None:
-                gen_device = req.sampling_params.generator_device
-            elif self.device.type == "cpu":
-                gen_device = "cpu"
-            else:
-                gen_device = self.device
-            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+        self._seed_generator(req.sampling_params)
 
     def _refresh_cache_for_requests(
         self,
@@ -569,8 +558,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         state: DiffusionRequestState,
         output: DiffusionOutput,
-        *,
-        is_primary: bool,
     ) -> None:
         merge_stage_durations(
             state,
@@ -689,16 +676,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self._initialize_generator(state)
         return state
 
-    def _initialize_generator(self, state: DiffusionRequestState) -> None:
-        """Seed the per-request RNG generator exactly like the stepwise path."""
-        if state.sampling.generator is None and state.sampling.seed is not None:
-            if state.sampling.generator_device is not None:
-                gen_device = state.sampling.generator_device
+    def _seed_generator(self, sampling: Any) -> None:
+        """Seed a sampling-params RNG generator in place from its ``seed``.
+
+        Single source of truth for the per-request generator-device ladder used
+        by every forward path (monolithic request setup, disaggregated encode
+        state creation, and stepwise batch admission): honor an explicit
+        ``generator_device``, else fall back to CPU on a CPU runner or this
+        runner's device otherwise. A no-op when the generator is already set or
+        no seed was provided.
+        """
+        if sampling.generator is None and sampling.seed is not None:
+            if sampling.generator_device is not None:
+                gen_device = sampling.generator_device
             elif self.device.type == "cpu":
                 gen_device = "cpu"
             else:
                 gen_device = self.device
-            state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+            sampling.generator = torch.Generator(device=gen_device).manual_seed(sampling.seed)
+
+    def _initialize_generator(self, state: DiffusionRequestState) -> None:
+        """Seed the per-request RNG generator exactly like the stepwise path."""
+        self._seed_generator(state.sampling)
 
     def _extract_incoming_payload(self, req: OmniDiffusionRequest) -> DiffusionStagePayload:
         """Pull the upstream DiffusionStagePayload out of a request prompt.
@@ -874,7 +873,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     raise RuntimeError(
                         f"Decode stage produced no output for request {req.request_id!r}."
                     )
-                self._attach_stepwise_metrics(state, output, is_primary=is_primary)
+                self._attach_stepwise_metrics(state, output)
             finally:
                 self.state_cache.pop(req.request_id, None)
             if is_primary:
@@ -962,14 +961,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         for state in states:
             if state.request_id in new_request_ids:
                 # set generator
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                self._seed_generator(state.sampling)
                 clear_pipeline_stage_durations(self.pipeline)
                 # encode
                 self.pipeline.prepare_encode(state)
@@ -1029,9 +1021,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
 
-        use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
+        with self._grad_context():
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1084,11 +1074,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 clear_pipeline_stage_durations(self.pipeline)
                                 result = self.pipeline.post_decode(req)
                                 if result is not None:
-                                    self._attach_stepwise_metrics(
-                                        req,
-                                        result,
-                                        is_primary=is_primary,
-                                    )
+                                    self._attach_stepwise_metrics(req, result)
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index

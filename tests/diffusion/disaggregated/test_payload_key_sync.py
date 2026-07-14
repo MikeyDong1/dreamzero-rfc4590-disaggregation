@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Guard: the runner and the transition processor must agree on the payload keys.
+"""Guard: every consumer of the cross-stage payload keys agrees with the canonical source.
 
-The runner (worker package) and the generic transition processor (model_executor
-package) each define STAGE_PAYLOAD_OUTPUT_KEY / STAGE_PAYLOAD_PROMPT_KEY locally
-to avoid a cross-package import at the worker layer. This test parses both source
-files (no torch import) and asserts the string literals are identical, so the two
-copies cannot drift.
+The canonical definitions of ``STAGE_PAYLOAD_OUTPUT_KEY`` / ``STAGE_PAYLOAD_PROMPT_KEY``
+live in ``vllm_omni.diffusion.stage_payload`` (the torch-free transport leaf). The
+torch-heavy consumers (``diffusion/worker/diffusion_model_runner.py`` and
+``experimental/ar_diffusion/runner.py``) import them directly, so they cannot drift.
+
+The generic transition processor (``model_executor/stage_input_processors/diffusion.py``)
+is the one exception: it is loaded by file path in the torch-free foundation tests
+(see ``conftest.py``), so it cannot ``from vllm_omni...`` import at module scope without
+pulling in the package ``__init__`` (and torch). It therefore re-declares the two keys as
+literals. This test parses both source files (no torch import) and asserts the processor's
+literals still equal the canonical constants, so that one hand-copy cannot drift.
 """
 
 from __future__ import annotations
@@ -16,8 +22,10 @@ from pathlib import Path
 
 VLLM_OMNI_ROOT = Path(__file__).resolve().parents[3] / "vllm_omni"
 
+_CANONICAL = VLLM_OMNI_ROOT / "diffusion" / "stage_payload.py"
 _PROCESSOR = VLLM_OMNI_ROOT / "model_executor" / "stage_input_processors" / "diffusion.py"
-_RUNNER = VLLM_OMNI_ROOT / "diffusion" / "worker" / "diffusion_model_runner.py"
+
+_KEY_NAMES = {"STAGE_PAYLOAD_OUTPUT_KEY", "STAGE_PAYLOAD_PROMPT_KEY"}
 
 
 def _module_string_constants(path: Path, names: set[str]) -> dict[str, str]:
@@ -32,12 +40,25 @@ def _module_string_constants(path: Path, names: set[str]) -> dict[str, str]:
     return found
 
 
-def test_payload_keys_match_between_runner_and_processor():
-    names = {"STAGE_PAYLOAD_OUTPUT_KEY", "STAGE_PAYLOAD_PROMPT_KEY"}
-    proc = _module_string_constants(_PROCESSOR, names)
-    runner = _module_string_constants(_RUNNER, names)
-    assert proc == {
+def test_processor_literals_match_canonical_source():
+    canonical = _module_string_constants(_CANONICAL, _KEY_NAMES)
+    processor = _module_string_constants(_PROCESSOR, _KEY_NAMES)
+    assert canonical == {
         "STAGE_PAYLOAD_OUTPUT_KEY": "__diffusion_stage_payload__",
         "STAGE_PAYLOAD_PROMPT_KEY": "diffusion_stage_payload",
-    }
-    assert runner == proc, f"payload key drift: runner={runner} processor={proc}"
+    }, f"canonical stage_payload keys changed unexpectedly: {canonical}"
+    assert processor == canonical, f"payload key drift: processor={processor} canonical={canonical}"
+
+
+def test_torch_heavy_consumers_do_not_redeclare_the_keys():
+    """The runner and AR-Diffusion runner must import the keys, not re-declare them.
+
+    A local re-declaration would reintroduce exactly the drift this single-source-of-truth
+    refactor removed, so assert those two files carry no top-level literal copy.
+    """
+    for rel in (
+        Path("diffusion") / "worker" / "diffusion_model_runner.py",
+        Path("experimental") / "ar_diffusion" / "runner.py",
+    ):
+        redeclared = _module_string_constants(VLLM_OMNI_ROOT / rel, _KEY_NAMES)
+        assert redeclared == {}, f"{rel} re-declares payload keys instead of importing them: {redeclared}"

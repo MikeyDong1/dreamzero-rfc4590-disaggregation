@@ -1100,9 +1100,10 @@ def build_diffusion_config(
     # can select encode/denoise/decode and the loader can gate components. This is
     # the narrowest wiring point — model_stage previously reached only the
     # head-side client, never the worker's od_config.
-    metadata_model_stage = getattr(metadata, "model_stage", None)
-    if metadata_model_stage is not None:
-        od_config.model_stage = metadata_model_stage
+    # ``model_stage`` is a required StageMetadata field (None only for the
+    # monolithic/legacy case), so read it directly rather than defensively.
+    if metadata.model_stage is not None:
+        od_config.model_stage = metadata.model_stage
     return od_config
 
 
