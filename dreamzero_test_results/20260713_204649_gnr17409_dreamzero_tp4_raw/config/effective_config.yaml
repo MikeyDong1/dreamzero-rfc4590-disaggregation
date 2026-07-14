@@ -1,0 +1,22 @@
+model: GEAR-Dreams/DreamZero-DROID
+model_path: /mnt/data/hub/models--GEAR-Dreams--DreamZero-DROID
+assets_repo: YangshenDeng/vllm-omni-dreamzero-assets
+serving_mode: offline
+proxy: 0
+denoise_steps: 16
+tensor_parallel_size: 4
+cfg_parallel_size: 1
+devices: 0,1,2,3
+dtype: bfloat16
+enforce_eager: true
+input_mode: raw_video
+node: gnr17409
+container: dz_tp4_dev
+image_base: vllm-omni-xpu:v0240
+source_override: /data/vllm-omni (mounted over /workspace/vllm-omni, editable install)
+vllm_version: 0.24.0+xpu
+vllm_omni_version: 0.1.dev5+gd1bad6c57.xpu
+compat_patches:
+  - vllm_omni/platforms/__init__.py (supports_xccl removal fix)
+  - vllm_omni/engine/stage_engine_core_proc_manager.py (set_device_control_env_var removal fix)
+  - vllm_omni/diffusion/model_loader/diffusers_loader.py + gguf_adapters/ (download_gguf removal fix)

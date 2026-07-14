@@ -25,7 +25,9 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZERO_SESSIONS
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
@@ -196,7 +198,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = dataclasses.replace(
             self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks
         )
-        free_bytes = torch.cuda.mem_get_info(self.device)[0]
+        free_bytes = current_omni_platform.get_free_memory(self.device)
         # Under CFG-parallel each rank executes exactly ONE branch (rank0 pos,
         # rank1 neg; the other branch's lazy contexts never allocate on this
         # rank), so its pool only needs one branch's capacity. A single-process
@@ -234,17 +236,47 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_frame_per_block=num_frame_per_block,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def _resolve_session_id(self, req: OmniDiffusionRequest) -> str:
+        """Resolve the AR-Diffusion session id for this request.
+
+        Monolithic path: ``sampling_params.extra_args["session_id"]``. Denoise
+        stage: the transition processor mirrors the encode payload's
+        ``metadata["session_id"]`` into both ``extra_args["session_id"]`` and
+        the prompt, so reading extra_args covers both. Falls back to the payload
+        metadata directly if extra_args did not carry it.
+        """
+        extra_args = req.sampling_params.extra_args or {}
+        session_id = extra_args.get("session_id")
+        if session_id is None and self.model_stage == DENOISE:
+            prompt = req.prompt
+            extra = prompt.get("extra") if isinstance(prompt, dict) else getattr(prompt, "extra", None)
+            payload = extra.get("diffusion_stage_payload") if isinstance(extra, dict) else None
+            if payload is not None:
+                session_id = getattr(payload, "metadata", {}).get("session_id")
+        return str(session_id or "default")
+
+    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         # KV disabled -> base behavior, unchanged.
         if self.kv_cache is None:
-            return super().execute_model(req)
+            return super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+
+        # Disaggregated encode/decode stages own NO AR-Diffusion KV: they run
+        # conditions encode / VAE decode only. Route them straight to the base
+        # runner's role dispatch without touching the session pool (RFC #4590
+        # §9.1: KV/session state lives exclusively on the denoise stage). The
+        # denoise stage (and the monolithic path) keep the session attach below.
+        role = self.model_stage
+        if role in (ENCODE, DECODE):
+            return super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
 
         kv = self.kv_cache
         # DreamZero KV is session-scoped (the model state persists across a
         # session's forwards), so the AR-Diffusion KV state is keyed by session_id and
         # reused — matching how pipeline.forward resolves the model-local state.
-        extra_args = req.sampling_params.extra_args or {}
-        session_id = str(extra_args.get("session_id") or "default")
+        # For the denoise stage the session id arrives in the payload metadata
+        # (mirrored to extra_args by the transition processor); for the
+        # monolithic path it is the request's own extra_args["session_id"].
+        session_id = self._resolve_session_id(req)
         state = self._ar_diffusion_states.get(session_id)
         if state is None:
             pos = kv.begin_request(f"bde__{session_id}")
@@ -273,7 +305,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # sync below makes the stop reflect completed GPU work, not just dispatch.
         _e2e_t0 = time.perf_counter()
         try:
-            out = super().execute_model(req)
+            out = super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
         except Exception:
             # Transactional containment: a forward that died partway may have
             # written some layers' K/V into allocated-but-uncommitted blocks

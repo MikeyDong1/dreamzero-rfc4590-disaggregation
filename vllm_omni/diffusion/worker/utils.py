@@ -50,6 +50,43 @@ def attach_stage_durations(
         output.stage_durations = dict(state.stage_durations)
 
 
+def run_encode_atoms(pipeline: Any, state: DiffusionRequestState) -> DiffusionRequestState:
+    """Run the encode portion of a pipeline, preferring finer atoms.
+
+    Additive compatibility shim (RFC #4590 §3): when the pipeline implements the
+    finer :class:`~vllm_omni.diffusion.models.interface.SupportsDiffusionAtoms`
+    contract, run ``check_inputs -> encode_conditions ->
+    prepare_latents_and_timesteps``; otherwise fall back to the existing
+    ``prepare_encode`` one-shot. Either way the (possibly mutated) state is
+    returned so callers do not depend on in-place vs return semantics.
+    """
+    from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
+
+    if supports_diffusion_atoms(pipeline):
+        state = pipeline.check_inputs(state) or state
+        state = pipeline.encode_conditions(state) or state
+        state = pipeline.prepare_latents_and_timesteps(state) or state
+        return state
+
+    result = pipeline.prepare_encode(state)
+    return result if result is not None else state
+
+
+def run_decode_atoms(pipeline: Any, state: DiffusionRequestState) -> DiffusionOutput:
+    """Run the decode portion of a pipeline, preferring finer atoms.
+
+    Mirror of :func:`run_encode_atoms`: prefer ``decode_latents ->
+    postprocess_outputs`` when available, else fall back to ``post_decode``.
+    """
+    from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
+
+    if supports_diffusion_atoms(pipeline):
+        state = pipeline.decode_latents(state) or state
+        return pipeline.postprocess_outputs(state)
+
+    return pipeline.post_decode(state)
+
+
 @dataclass
 class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.

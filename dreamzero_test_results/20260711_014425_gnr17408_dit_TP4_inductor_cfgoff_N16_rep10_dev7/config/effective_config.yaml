@@ -1,0 +1,26 @@
+test: dreamzero_dit_only_tensor_parallel_inductor_cfgoff
+model: GEAR-Dreams/DreamZero-DROID
+component_under_test: DiT (action_head.model.*) ONLY
+encoders_on_xpu: false
+input: pre-encoded dit_inputs.pt (same as prior TP=4 eager baseline)
+serving_mode: offline
+proxy: 0
+denoise_steps: 16
+requests: 1 (+ 10 sequential repeats)
+node: gnr17408
+cards: "4,5,6,7"
+image: vllm-omni-xpu:mikey-dev7
+parallelism:
+  tensor_parallel_size: 4
+  world_size: 4
+  launch: torchrun --nproc_per_node=4
+offload_mode: full_resident
+dtype: bfloat16
+enforce_eager: true            # pipeline-level flag; per-block torch.compile applied separately
+compile: inductor               # torch.compile(mode=default, fullgraph=False) on all 40 DiT blocks
+compile_fullgraph: false        # graph-break at _vllm_fa2_C::varlen_fwd (no fake/meta kernel)
+cfg: off                        # no classifier-free guidance; 1 DiT fwd/step not 2
+attention_backend: FLASH_ATTN (_vllm_fa2_C varlen_fwd, stays eager)
+seed: model default
+measurement: warm (1 discarded warmup, which also pays the inductor first-call compile cost)
+repeat: 10 sequential identical single-request calls after the profiled run

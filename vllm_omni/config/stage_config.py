@@ -294,6 +294,18 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references itself")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
+
+        # RFC #4590: apply the disaggregated-diffusion topology rules when any
+        # stage declares a disaggregated role (encode/denoise/decode). This
+        # catches denoise-without-encode-source, decode-without-denoise-source,
+        # bad final-output placement, and unmergeable multi-source consumers.
+        from vllm_omni.diffusion.stage_roles import (
+            DISAGGREGATED_ROLES,
+            validate_linear_diffusion_topology,
+        )
+
+        if any(s.model_stage in DISAGGREGATED_ROLES for s in self.stages):
+            errors.extend(validate_linear_diffusion_topology(self.stages))
         return errors
 
 

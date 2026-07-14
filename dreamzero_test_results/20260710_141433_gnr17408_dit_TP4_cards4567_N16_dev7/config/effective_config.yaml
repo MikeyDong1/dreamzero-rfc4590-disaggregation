@@ -1,0 +1,25 @@
+# Effective config for the TP=4 DiT-only profiling run (as executed).
+test: dreamzero_dit_only_tensor_parallel
+model: GEAR-Dreams/DreamZero-DROID
+component_under_test: DiT (action_head.model.*) ONLY
+encoders_on_xpu: false          # UMT5 text encoder + Wan VAE NOT moved to XPU
+input: pre-encoded dit_inputs.pt (from TP=8 preprocessing capture)
+serving_mode: offline
+proxy: 0
+denoise_steps: 16
+requests: 1
+node: gnr17408
+cards: "4,5,6,7"              # ZE_AFFINITY_MASK -> in-container xpu:0..3
+image: vllm-omni-xpu:mikey-dev7 # torch 2.11+xpu; proven direct-drive DiT path
+parallelism:
+  tensor_parallel_size: 4
+  world_size: 4
+  cfg_parallel_size: 1
+  data_parallel_size: 1
+  launch: torchrun --nproc_per_node=4
+offload_mode: full_resident      # each rank holds its 1/4 shard; no layerwise offload
+dtype: bfloat16
+enforce_eager: true
+attention_backend: FLASH_ATTN (_vllm_fa2_C varlen_fwd)
+seed: model default
+measurement: warm (1 discarded warmup); timing from a clean no-profiler run
