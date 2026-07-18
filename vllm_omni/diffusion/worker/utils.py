@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_omni.diffusion.models.interface import supports_diffusion_atoms
-
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -52,48 +50,15 @@ def attach_stage_durations(
         output.stage_durations = dict(state.stage_durations)
 
 
-def run_encode_atoms(pipeline: Any, state: DiffusionRequestState) -> DiffusionRequestState:
-    """Run the encode portion of a pipeline, preferring finer atoms.
-
-    Additive compatibility shim (RFC #4590 §3): when the pipeline implements the
-    finer :class:`~vllm_omni.diffusion.models.interface.SupportsDiffusionAtoms`
-    contract, run ``check_inputs -> encode_conditions ->
-    prepare_latents_and_timesteps``; otherwise fall back to the existing
-    ``prepare_encode`` one-shot. Either way the (possibly mutated) state is
-    returned so callers do not depend on in-place vs return semantics.
-    """
-    if supports_diffusion_atoms(pipeline):
-        state = pipeline.check_inputs(state) or state
-        state = pipeline.encode_conditions(state) or state
-        state = pipeline.prepare_latents_and_timesteps(state) or state
-        return state
-
-    result = pipeline.prepare_encode(state)
-    return result if result is not None else state
-
-
-def run_decode_atoms(pipeline: Any, state: DiffusionRequestState) -> DiffusionOutput:
-    """Run the decode portion of a pipeline, preferring finer atoms.
-
-    Mirror of :func:`run_encode_atoms`: prefer ``decode_latents ->
-    postprocess_outputs`` when available, else fall back to ``post_decode``.
-    """
-    if supports_diffusion_atoms(pipeline):
-        state = pipeline.decode_latents(state) or state
-        return pipeline.postprocess_outputs(state)
-
-    return pipeline.post_decode(state)
-
-
 @dataclass
 class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:
-    ``prepare_encode()`` initializes/updates fields, ``denoise_step()`` and
-    ``step_scheduler()`` mutate per-step fields, and ``post_decode()``
-    consumes final latents. This state object is also the cache unit for
-    future continuous batching.
+    ``prepare`` initializes request state, ``denoise_step`` and
+    ``step_scheduler`` mutate per-step fields, and ``decode`` consumes
+    final/chunk latents. This state object is also the cache unit for future
+    continuous batching.
 
     This dataclass keeps only the minimal cross-model state required by the
     step-execution contract. Pipeline-specific state should be stored in
@@ -113,7 +78,7 @@ class DiffusionRequestState:
     prompt: OmniPromptType | None = None
     kv_sender_info: dict | None = None
 
-    # ── Encoded prompts (set once by prepare_encode) ──
+    # ── Encoded prompts (set once by encode) ──
     prompt_embeds: torch.Tensor | None = None
     prompt_embeds_mask: torch.Tensor | None = None
     negative_prompt_embeds: torch.Tensor | None = None
@@ -122,7 +87,7 @@ class DiffusionRequestState:
     # ── Latent state (mutated every step by step_scheduler) ──
     latents: torch.Tensor | None = None
 
-    # ── Timestep schedule (set once by prepare_encode) ──
+    # ── Timestep schedule (set once by prepare) ──
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
@@ -132,14 +97,14 @@ class DiffusionRequestState:
     total_chunks: int = 1
     chunk_num_steps: int | None = None
 
-    # ── Per-request scheduler instance (set once by prepare_encode) ──
+    # ── Per-request scheduler instance (set once by prepare) ──
     scheduler: Any | None = None
 
-    # ── CFG config (set once by prepare_encode) ──
+    # ── CFG config (set once by prepare) ──
     do_true_cfg: bool = False
     guidance: torch.Tensor | None = None
 
-    # ── Spatial / sequence metadata (set once by prepare_encode) ──
+    # ── Spatial / sequence metadata (set once by prepare) ──
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None

@@ -239,10 +239,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """Resolve the AR-Diffusion session id for this request.
 
         Monolithic path: ``sampling_params.extra_args["session_id"]``. Denoise
-        stage: the transition processor mirrors the encode payload's
-        ``metadata["session_id"]`` into both ``extra_args["session_id"]`` and
-        the prompt, so reading extra_args covers both. Falls back to the payload
-        metadata directly if extra_args did not carry it.
+        stage: the transition processor mirrors the encode payload's public
+        ``scalar_fields["session_id"]`` into both ``extra_args["session_id"]`` and
+        the prompt, so reading extra_args covers both. Falls back to the payload's
+        public ``scalar_fields`` directly if extra_args did not carry it (handling
+        both a live ``StagePayload`` and a msgpack-flattened plain dict).
         """
         extra_args = req.sampling_params.extra_args or {}
         session_id = extra_args.get("session_id")
@@ -251,7 +252,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             extra = prompt.get("extra") if isinstance(prompt, dict) else getattr(prompt, "extra", None)
             payload = extra.get(STAGE_PAYLOAD_PROMPT_KEY) if isinstance(extra, dict) else None
             if payload is not None:
-                session_id = getattr(payload, "metadata", {}).get("session_id")
+                scalar_fields = payload.get("scalar_fields") if isinstance(payload, dict) else getattr(
+                    payload, "scalar_fields", {}
+                )
+                session_id = (scalar_fields or {}).get("session_id")
         return str(session_id or "default")
 
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:

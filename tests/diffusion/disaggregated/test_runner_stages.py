@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Behavioral runner tests for disaggregated stages (RFC #4590 §14.3).
+"""Behavioral runner tests for disaggregated stages (#4948 DiffusionV2Atoms).
 
 These import the real ``DiffusionModelRunner`` and drive it with fake pipelines
 and lightweight tensors, so they require torch + the vllm_omni runtime. They are
@@ -23,8 +23,8 @@ try:
     import torch
 
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.stage_payload import DiffusionStagePayload
     from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE, StageComponentSpec
     from vllm_omni.diffusion.worker.diffusion_model_runner import (
         STAGE_PAYLOAD_OUTPUT_KEY,
@@ -37,79 +37,88 @@ except Exception as exc:  # ImportError, or torch DLL load failure
 
 pytestmark = pytest.mark.needs_runtime
 
+_CARRIER_KEY = "fake_carrier"
+
 
 class FakeDisaggregatedPipeline:
-    """Minimal pipeline implementing the disaggregated + atom protocols.
+    """Minimal pipeline implementing the DiffusionV2Atoms disaggregation contract.
 
-    Records which hooks ran so tests can assert a stage never crosses into
+    Records which atoms ran so tests can assert a stage never crosses into
     another stage's work (no DiT on encode/decode, no encode on denoise, etc.).
+    Everything is stashed on a private carrier on ``state.extra`` and marshalled
+    through pack/unpack_stage_state, mirroring the DreamZero shape.
     """
 
     supports_disaggregated_execution = True
-    supports_diffusion_atoms = True
+    supports_step_execution = False
 
     def __init__(self):
         self.calls: list[str] = []
         self.enable_diffusion_pipeline_profiler = False
 
-    # --- atom protocol (encode) ---
-    def check_inputs(self, state, **kw):
+    # --- DiffusionV2Atoms (encode chain) ---
+    def init_state(self, state):
+        self.calls.append("init_state")
+        state.extra.pop(_CARRIER_KEY, None)
+        return state
+
+    def check_inputs(self, state):
         self.calls.append("check_inputs")
         return state
 
-    def encode_conditions(self, state, **kw):
-        self.calls.append("encode_conditions")
-        state.prompt_embeds = torch.zeros(1, 4)
+    def encode(self, state):
+        self.calls.append("encode")
+        state.extra[_CARRIER_KEY] = {"prompt_embeds": torch.zeros(1, 4)}
         return state
 
-    def prepare_latents_and_timesteps(self, state, **kw):
-        self.calls.append("prepare_latents_and_timesteps")
-        state.latents = torch.zeros(1, 16)
-        state.timesteps = torch.arange(4)
+    def prepare(self, state):
+        self.calls.append("prepare")
         return state
 
-    # --- atom protocol (decode) ---
-    def decode_latents(self, state, **kw):
-        self.calls.append("decode_latents")
+    # --- denoise (whole-request atom) ---
+    def diffuse(self, state):
+        self.calls.append("diffuse")
+        carrier = state.extra[_CARRIER_KEY]
+        carrier["latents"] = torch.ones(1, 16)
         return state
 
-    def postprocess_outputs(self, state, **kw):
-        self.calls.append("postprocess_outputs")
+    # --- decode chain ---
+    def decode(self, state):
+        self.calls.append("decode")
+        return state
+
+    def postprocess(self, state):
+        self.calls.append("postprocess")
         return DiffusionOutput(output={"image": torch.zeros(3, 8, 8)})
 
-    # --- denoise ---
-    def run_denoise(self, state, **kw):
-        self.calls.append("run_denoise")
-        state.latents = torch.ones(1, 16)
-
-    # --- disaggregated payload hooks ---
-    def export_stage_payload(self, state, *, source_stage, target_stage):
-        self.calls.append(f"export:{source_stage}->{target_stage}")
-        tensors = {}
-        if state.latents is not None:
-            tensors["latents"] = state.latents
-        if state.prompt_embeds is not None:
-            tensors["prompt_embeds"] = state.prompt_embeds
-        return DiffusionStagePayload.create(
+    # --- payload marshalling ---
+    def pack_stage_state(self, state, boundary):
+        self.calls.append(f"pack:{boundary.value}")
+        carrier = state.extra.get(_CARRIER_KEY, {})
+        return StagePayload.create(
             request_id=state.request_id,
-            source_stage=source_stage,
-            target_stage=target_stage,
-            payload_type=f"{source_stage}_to_{target_stage}",
-            tensors=tensors,
-            metadata={"session_id": "sess"},
+            boundary=boundary,
+            scalar_fields={"session_id": "sess"},
+            private_tensor_fields={k: v for k, v in carrier.items() if v is not None},
         )
 
-    def import_stage_payload(self, payload, *, target_stage, request=None):
-        self.calls.append(f"import:{target_stage}")
-        from vllm_omni.diffusion.worker.utils import DiffusionRequestState
-
-        state = DiffusionRequestState(
-            request_id=payload.request_id,
-            sampling=OmniDiffusionSamplingParams(),
-        )
-        if "latents" in payload.tensors:
-            state.latents = payload.tensors["latents"]
+    def unpack_stage_state(self, payload, state):
+        self.calls.append("unpack")
+        state.extra[_CARRIER_KEY] = dict(payload.private_tensor_fields)
         return state
+
+    # --- step-only stubs (unused: request-mode pipeline) ---
+    def build_step_batch(self, states, *, cached_batch=None):
+        raise NotImplementedError
+
+    def build_step_attention_metadata(self, input_batch):
+        return None
+
+    def denoise_step(self, input_batch):
+        raise NotImplementedError
+
+    def step_scheduler(self, state, noise_pred):
+        raise NotImplementedError
 
     @classmethod
     def required_components_for_stage(cls, model_stage):
@@ -145,71 +154,67 @@ def _request(prompt):
     )
 
 
+def _encode_payload():
+    return StagePayload.create(
+        request_id="req-1",
+        boundary=StageBoundary.ENCODE_TO_DIT,
+        scalar_fields={"session_id": "sess"},
+        private_tensor_fields={"prompt_embeds": torch.zeros(1, 4)},
+    )
+
+
+def _denoise_payload():
+    return StagePayload.create(
+        request_id="req-1",
+        boundary=StageBoundary.DIT_TO_DECODE,
+        scalar_fields={"session_id": "sess"},
+        private_tensor_fields={"latents": torch.ones(1, 16)},
+    )
+
+
 def test_encode_stage_runs_only_encode_atoms():
     runner = _make_runner(ENCODE)
     out = runner.execute_encode_stage(_request({"prompt": "hi"}))
     calls = runner.pipeline.calls
-    assert "check_inputs" in calls and "encode_conditions" in calls
-    assert "run_denoise" not in calls and "decode_latents" not in calls
+    assert calls[:4] == ["init_state", "check_inputs", "encode", "prepare"]
+    assert "diffuse" not in calls and "decode" not in calls
     payload = out.custom_output[STAGE_PAYLOAD_OUTPUT_KEY]
-    assert payload.source_stage == ENCODE and payload.target_stage == DENOISE
+    assert payload.boundary is StageBoundary.ENCODE_TO_DIT
     # state released
     assert "req-1" not in runner.state_cache
 
 
-def test_denoise_stage_imports_payload_and_does_not_encode():
+def test_denoise_stage_unpacks_payload_and_does_not_encode():
     runner = _make_runner(DENOISE)
-    enc_payload = DiffusionStagePayload.create(
-        request_id="req-1",
-        source_stage=ENCODE,
-        target_stage=DENOISE,
-        payload_type="encode_to_denoise",
-        tensors={"latents": torch.zeros(1, 16)},
-        metadata={"session_id": "sess"},
-    )
-    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: enc_payload}})
+    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: _encode_payload()}})
     out = runner.execute_denoise_stage(req)
     calls = runner.pipeline.calls
-    assert "import:denoise" in calls and "run_denoise" in calls
-    assert "check_inputs" not in calls and "encode_conditions" not in calls
+    assert "unpack" in calls and "diffuse" in calls
+    assert "check_inputs" not in calls and "encode" not in calls
     payload = out.custom_output[STAGE_PAYLOAD_OUTPUT_KEY]
-    assert payload.source_stage == DENOISE and payload.target_stage == DECODE
+    assert payload.boundary is StageBoundary.DIT_TO_DECODE
 
 
 def test_decode_stage_runs_only_decode():
     runner = _make_runner(DECODE)
-    den_payload = DiffusionStagePayload.create(
-        request_id="req-1",
-        source_stage=DENOISE,
-        target_stage=DECODE,
-        payload_type="denoise_to_decode",
-        tensors={"latents": torch.ones(1, 16)},
-        metadata={"session_id": "sess"},
-    )
-    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: den_payload}})
+    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: _denoise_payload()}})
     out = runner.execute_decode_stage(req)
     calls = runner.pipeline.calls
-    assert "decode_latents" in calls and "postprocess_outputs" in calls
-    assert "run_denoise" not in calls
+    assert "unpack" in calls and "decode" in calls and "postprocess" in calls
+    assert "diffuse" not in calls
     assert out.output is not None and "image" in out.output
 
 
-def test_denoise_rejects_wrong_transition():
+def test_denoise_rejects_wrong_boundary():
     runner = _make_runner(DENOISE)
-    wrong = DiffusionStagePayload.create(
-        request_id="req-1",
-        source_stage=DENOISE,
-        target_stage=DECODE,
-        payload_type="denoise_to_decode",
-        tensors={"latents": torch.ones(1, 16)},
-    )
-    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: wrong}})
-    with pytest.raises(Exception, match="transition"):
+    # A DIT_TO_DECODE payload arriving at the denoise stage must be rejected.
+    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: _denoise_payload()}})
+    with pytest.raises(Exception, match="boundary"):
         runner.execute_denoise_stage(req)
 
 
 def test_missing_payload_raises_actionable_error():
     runner = _make_runner(DENOISE)
     req = _request({"prompt": "no payload here"})
-    with pytest.raises(Exception, match="without a DiffusionStagePayload"):
+    with pytest.raises(Exception, match="without a StagePayload"):
         runner.execute_denoise_stage(req)

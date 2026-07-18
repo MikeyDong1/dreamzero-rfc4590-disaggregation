@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Generic diffusion -> diffusion stage transition processor (RFC #4590 §6).
+"""Generic diffusion -> diffusion stage transition processor.
 
-One model-agnostic adapter moves a :class:`DiffusionStagePayload` from an
-upstream diffusion stage's output into the downstream diffusion stage's request,
-for every disaggregated diffusion model. It does *not* decode model-specific
-tensor keys; the payload round-trips opaquely through the owning pipeline's
-``export_stage_payload`` / ``import_stage_payload`` hooks.
+One model-agnostic adapter moves a :class:`StagePayload` from an upstream
+diffusion stage's output into the downstream diffusion stage's request, for every
+disaggregated diffusion model. It does *not* decode model-specific tensor keys;
+the payload round-trips opaquely through the owning pipeline's
+``pack_stage_state`` / ``unpack_stage_state`` hooks (the DiffusionV2Atoms
+contract).
 
 Wiring: set a stage's ``custom_process_input_func`` to
 ``vllm_omni.model_executor.stage_input_processors.diffusion.diffusion_stage_transition``.
@@ -21,8 +22,8 @@ diffusion pipeline reads for cross-stage data). Both the upstream
 ``DiffusionOutput.custom_output`` and the prompt ``extra`` dict are already
 part of the msgpack transport contract; msgpack does not preserve dataclass
 identity across the out-of-process (multiproc) stage client, so
-``_unwrap_stage_payload`` rehydrates the payload via
-``DiffusionStagePayload.from_dict`` when it arrives as a plain dict.
+``_unwrap_stage_payload`` rehydrates the payload via ``StagePayload.from_dict``
+when it arrives as a plain dict.
 """
 
 from __future__ import annotations
@@ -51,33 +52,43 @@ GENERIC_DIFFUSION_PROCESSOR = (
 # asserts these literals stay equal to the canonical constants so the copies cannot drift.
 
 #: Key under which a stage's ``DiffusionOutput.custom_output`` carries the
-#: outgoing :class:`DiffusionStagePayload`.
+#: outgoing :class:`StagePayload`.
 STAGE_PAYLOAD_OUTPUT_KEY = "__diffusion_stage_payload__"
 
 #: Key under which the downstream request prompt's ``extra`` dict carries the
-#: incoming :class:`DiffusionStagePayload`.
+#: incoming :class:`StagePayload`.
 STAGE_PAYLOAD_PROMPT_KEY = "diffusion_stage_payload"
 
 
 def _is_stage_payload(value: Any) -> bool:
-    """Duck-typed DiffusionStagePayload check (no hard import of the class).
+    """Duck-typed StagePayload check (no hard import of the class).
 
     Recognizes a payload by its distinctive attribute surface so the processor
     stays importable even in minimal environments; falls back to an ``isinstance``
     check against the real class when it is importable.
     """
-    if all(hasattr(value, attr) for attr in ("schema_version", "request_id", "source_stage", "tensors", "metadata")):
+    if all(
+        hasattr(value, attr)
+        for attr in ("request_id", "boundary", "tensor_fields", "scalar_fields", "payload_version")
+    ):
         return True
     try:
-        from vllm_omni.diffusion.stage_payload import DiffusionStagePayload
+        from vllm_omni.diffusion.models.interface import StagePayload
 
-        return isinstance(value, DiffusionStagePayload)
+        return isinstance(value, StagePayload)
     except Exception:  # pragma: no cover - import-environment dependent
         return False
 
 
+def _rehydrate_stage_payload(payload_dict: dict[str, Any]) -> Any:
+    """Rebuild a :class:`StagePayload` from a msgpack-flattened plain dict."""
+    from vllm_omni.diffusion.models.interface import StagePayload
+
+    return StagePayload.from_dict(payload_dict)
+
+
 def _unwrap_stage_payload(source_output: Any) -> Any | None:
-    """Extract a :class:`DiffusionStagePayload` from an upstream stage output.
+    """Extract a :class:`StagePayload` from an upstream stage output.
 
     Accepts either a ``DiffusionOutput``-like object exposing ``custom_output``,
     a mapping, or an object that already *is* a payload. Returns ``None`` when
@@ -86,9 +97,9 @@ def _unwrap_stage_payload(source_output: Any) -> Any | None:
     The out-of-process (multiproc) stage client round-trips ``custom_output``
     through msgpack, which does not preserve dataclass identity: the payload
     arrives here as a plain ``dict`` with the same keys as
-    :class:`DiffusionStagePayload`'s fields rather than the dataclass itself.
-    Rehydrate it via :meth:`DiffusionStagePayload.from_dict` before returning
-    so :meth:`validate` (called by the caller) works on both paths.
+    :class:`StagePayload`'s fields rather than the dataclass itself. Rehydrate it
+    via :meth:`StagePayload.from_dict` before returning so :meth:`validate`
+    (called by the caller) works on both paths.
     """
     if _is_stage_payload(source_output):
         return source_output
@@ -102,9 +113,7 @@ def _unwrap_stage_payload(source_output: Any) -> Any | None:
             if _is_stage_payload(payload):
                 return payload
             if isinstance(payload, dict):
-                from vllm_omni.diffusion.stage_payload import DiffusionStagePayload
-
-                return DiffusionStagePayload.from_dict(payload)
+                return _rehydrate_stage_payload(payload)
             return payload
     return None
 
@@ -150,7 +159,7 @@ def diffusion_stage_transition(
 
     Args:
         source_outputs: Upstream stage outputs; ``source_outputs[0]`` carries
-            the :class:`DiffusionStagePayload` in its ``custom_output``.
+            the :class:`StagePayload` in its ``custom_output``.
         prompt: The original request prompt (for request-level passthrough).
         requires_multimodal_data: Honored generically — unused here because the
             payload already carries every conditioning tensor the model packed.
@@ -193,19 +202,19 @@ def diffusion_stage_transition(
     # Mirror the session id into extra_args so the AR-Diffusion denoise runner
     # (which keys session state by extra_args["session_id"]) attaches the right
     # live session — this is generic session-id plumbing, not model semantics.
-    session_id = payload.metadata.get("session_id")
+    # session_id rides in the PUBLIC ``scalar_fields`` so the processor never
+    # decodes model-private schema.
+    session_id = payload.scalar_fields.get("session_id")
     if session_id is not None:
         diffusion_prompt["session_id"] = session_id
 
     _passthrough_prompt_fields(prompt, diffusion_prompt)
 
     logger.debug(
-        "[diffusion_stage_transition] req=%s %s->%s payload_type=%s tensors=%d meta_keys=%d",
+        "[diffusion_stage_transition] req=%s boundary=%s tensors=%d private_tensors=%d",
         payload.request_id,
-        payload.source_stage,
-        payload.target_stage,
-        payload.payload_type,
-        len(payload.tensors),
-        len(payload.metadata),
+        getattr(payload.boundary, "value", payload.boundary),
+        len(payload.tensor_fields),
+        len(payload.private_tensor_fields),
     )
     return diffusion_prompt

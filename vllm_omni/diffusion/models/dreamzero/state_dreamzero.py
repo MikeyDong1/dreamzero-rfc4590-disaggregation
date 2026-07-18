@@ -28,8 +28,8 @@ class DreamZeroStageCarrier:
     read and write this carrier. In the monolithic path all three run in one
     process on one carrier, so the composition is byte-identical to the original
     forward. In the disaggregated path each phase runs in its own worker and the
-    carrier's stable fields are marshalled through a ``DiffusionStagePayload`` by
-    the pipeline's ``export_stage_payload`` / ``import_stage_payload`` hooks.
+    carrier's stable fields are marshalled through a ``StagePayload`` by the
+    pipeline's ``pack_stage_state`` / ``unpack_stage_state`` hooks.
 
     This is model-private state (kept out of the generic ``DiffusionRequestState``
     per RFC §2.3): it is stored on ``DiffusionRequestState.extra`` and interpreted

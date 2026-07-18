@@ -15,6 +15,7 @@ import os
 import re
 from collections import OrderedDict
 from collections.abc import Iterable
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -54,8 +55,9 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SEED,
     DEFAULT_SIGMA_SHIFT,
 )
+from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.stage_payload import DiffusionStagePayload, StagePayloadError
+from vllm_omni.diffusion.stage_payload import StagePayloadError
 from vllm_omni.diffusion.stage_roles import (
     ALL_COMPONENTS,
     DECODE,
@@ -138,9 +140,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     # DreamZero requires a real robot_obs (raw camera frames) for every
     # request; the engine's synthetic dummy-warmup request has no robot_obs
-    # and would fail check_inputs/encode_conditions on every role (encode,
-    # denoise, decode -- not just the monolithic path, which special-cases it
-    # in forward()). Skip the warmup entirely rather than special-case each
+    # and would fail check_inputs/encode on every role (encode, denoise,
+    # decode -- not just the monolithic path, which special-cases it in
+    # forward()). Skip the warmup entirely rather than special-case each
     # disaggregated atom.
     dummy_run_num_frames = 0
 
@@ -1168,7 +1170,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 cfg_normalize=False,
             )
 
-    def diffuse(
+    def _run_dit_loop(
         self,
         video_latents: torch.Tensor,
         action_latents: torch.Tensor,
@@ -1182,6 +1184,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Denoising loop with CFG parallel support.
+
+        Internal per-chunk DiT loop over video+action latents. Renamed from the
+        former ``diffuse`` to avoid colliding with the ``DiffusionV2Atoms.diffuse``
+        whole-request denoise atom (see :meth:`diffuse`).
 
         For each timestep:
           1. Build positive_kwargs / negative_kwargs
@@ -1658,7 +1664,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             sample_scheduler_action,
         )
 
-        video_out, action_out = self.diffuse(
+        video_out, action_out = self._run_dit_loop(
             video_latents=carrier.noise_obs,
             action_latents=carrier.noise_action,
             timesteps_video=sample_scheduler.timesteps,
@@ -1720,26 +1726,59 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
     # -----------------------------------------------------------------------
-    # Disaggregated diffusion protocol (RFC #4590)
+    # Disaggregated diffusion protocol (DiffusionV2Atoms — #4948 contract)
     # -----------------------------------------------------------------------
 
     #: DreamZero supports the three-stage encode/denoise/decode topology. The
     #: runner selects the path from ``od_config.model_stage``; the pipeline
-    #: marshals its private carrier through DiffusionStagePayload here.
+    #: marshals its private carrier through :class:`StagePayload` here. This flag
+    #: (plus the DiffusionV2Atoms method surface) is what
+    #: ``supports_disaggregated_execution(pipeline)`` gates on.
     supports_disaggregated_execution: bool = True
 
-    #: DreamZero implements the finer diffusion atoms (check_inputs /
-    #: encode_conditions / prepare_latents_and_timesteps / decode_latents /
-    #: postprocess_outputs). This flag is REQUIRED: the runner's
-    #: run_encode_atoms / run_decode_atoms shims gate on
-    #: ``isinstance(pipeline, SupportsDiffusionAtoms)``, which — for a
-    #: @runtime_checkable Protocol with a ClassVar member — is only True when the
-    #: flag attribute is present. Without it the shims would fall back to
-    #: prepare_encode/post_decode, which DreamZero does not implement.
-    supports_diffusion_atoms: bool = True
+    #: DreamZero runs only as a request-mode / disaggregated pipeline (it drives
+    #: the whole-request ``diffuse`` atom with model-owned AR-Diffusion KV, not
+    #: the single-process step loop). Kept ``False`` so the worker never routes
+    #: it to the single-process DiffusionModelRunnerV2 step runner.
+    supports_step_execution: bool = False
 
     #: Key under which the DreamZero carrier lives on DiffusionRequestState.extra.
     _CARRIER_KEY = "dreamzero_carrier"
+
+    #: Carrier fields packed into a StagePayload per stage boundary. Everything
+    #: DreamZero carries is model-private, so tensors go in
+    #: ``private_tensor_fields`` and scalars in ``private_scalar_fields``; only
+    #: ``session_id`` is public (the transition processor + AR runner read it to
+    #: attach the right AR-Diffusion KV session without decoding private schema).
+    _PAYLOAD_TENSOR_FIELDS: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "clip_feas",
+            "ys",
+            "image_latent",
+            "state_features",
+            "embodiment_id",
+            "noise_obs",
+            "noise_action",
+            "state_for_postprocess",
+        ),
+        StageBoundary.DIT_TO_DECODE: ("video_out", "action_out", "state_for_postprocess"),
+    }
+    _PAYLOAD_SCALAR_FIELDS: ClassVar[tuple[str, ...]] = (
+        "embodiment_name",
+        "transform_embodiment",
+        "reset_reason",
+        "explicit_reset",
+        "do_true_cfg",
+        "current_start_frame",
+        "height",
+        "width",
+        "seq_len",
+        "frame_seqlen",
+        "num_inference_steps",
+        "sigma_shift",
+    )
 
     @classmethod
     def required_components_for_stage(cls, model_stage: str) -> StageComponentSpec:
@@ -1772,12 +1811,19 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # this stays in step with StageComponentSpec if a component is ever added.
         return ALL_COMPONENTS
 
-    # -- runner-facing atoms -------------------------------------------------
-    # The runner's run_encode_atoms / run_decode_atoms compat shims prefer these
-    # finer atoms. Each stores/reads the DreamZero carrier on state.extra so the
+    # -- DiffusionV2Atoms state-based atoms ----------------------------------
+    # The runner drives these explicitly (encode: init_state -> check_inputs ->
+    # encode -> prepare; denoise: unpack -> diffuse; decode: unpack -> decode ->
+    # postprocess). Each stores/reads the DreamZero carrier on state.extra so the
     # generic DiffusionRequestState never grows model-private fields.
 
-    def check_inputs(self, state: DiffusionRequestState, **kwargs) -> DiffusionRequestState:
+    def init_state(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Initialize a fresh request state before encode (clear stale carrier)."""
+        state.extra.pop(self._CARRIER_KEY, None)
+        state.extra.pop("decoded_output", None)
+        return state
+
+    def check_inputs(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Validate that a raw request carries a robot observation."""
         extra_args = getattr(state.sampling, "extra_args", None) or {}
         if extra_args.get("robot_obs") is None:
@@ -1786,7 +1832,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
         return state
 
-    def encode_conditions(self, state: DiffusionRequestState, **kwargs) -> DiffusionRequestState:
+    def encode(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Run the encode phase and stash the DreamZero carrier on state.extra."""
         extra_args = getattr(state.sampling, "extra_args", None) or {}
         robot_obs = extra_args["robot_obs"]
@@ -1803,7 +1849,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         state.extra[self._CARRIER_KEY] = carrier
         return state
 
-    def prepare_latents_and_timesteps(self, state: DiffusionRequestState, **kwargs) -> DiffusionRequestState:
+    def prepare(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """No-op atom: the encode phase already prepared initial noise + schedule.
 
         DreamZero's timestep schedule is rebuilt on the denoise worker from the
@@ -1813,17 +1859,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """
         return state
 
-    def run_denoise(self, state: DiffusionRequestState, **kwargs) -> DiffusionRequestState:
-        """Denoise-stage hook: run the DiT loop on the restored carrier.
+    def diffuse(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Whole-request denoise atom: run the DiT loop on the restored carrier.
 
         Called by the runner's denoise stage. The AR-Diffusion KV/session state
         was attached to the pipeline by ARDiffusionModelRunner before this call.
+        DreamZero runs the entire per-request denoise here (its dual video+action
+        DiT loop with model-owned KV), so it does NOT implement the single-step
+        ``denoise_step`` / ``step_scheduler`` contract.
         """
         carrier = state.extra.get(self._CARRIER_KEY)
         if carrier is None:
             raise StagePayloadError(
                 f"DreamZero denoise for {state.request_id!r} has no carrier on state.extra "
-                f"[{self._CARRIER_KEY!r}] — import_stage_payload must run first."
+                f"[{self._CARRIER_KEY!r}] — unpack_stage_state must run first."
             )
         dz_state = self._get_or_create_state(carrier.session_id)
         self.state = dz_state
@@ -1846,12 +1895,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._run_denoise_phase(carrier, dz_state)
         return state
 
-    def decode_latents(self, state: DiffusionRequestState, **kwargs) -> DiffusionRequestState:
-        """No-op atom: DreamZero's decode phase does action denorm + video export
-        together in :meth:`postprocess_outputs`; kept for protocol symmetry."""
+    def decode(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """No-op atom: DreamZero's decode work happens in :meth:`postprocess`
+        (action denorm + video export from the carrier); kept for symmetry."""
         return state
 
-    def postprocess_outputs(self, state: DiffusionRequestState, **kwargs) -> DiffusionOutput:
+    def postprocess(self, state: DiffusionRequestState) -> DiffusionOutput:
         """Run the decode phase from the restored carrier -> user-visible output."""
         carrier = state.extra.get(self._CARRIER_KEY)
         if carrier is None:
@@ -1860,100 +1909,82 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
         return self._run_decode_phase(carrier)
 
-    # -- payload marshalling -------------------------------------------------
+    # -- step-only atoms (unused: DreamZero is request-mode / disaggregated) --
+    # DreamZero's dual video+action denoise with model-owned AR-Diffusion KV does
+    # not fit the single-tensor step contract; it overrides ``diffuse`` instead.
+    # These stubs exist so ``isinstance(pipeline, DiffusionV2Atoms)`` holds while
+    # making the request-mode-only intent explicit.
 
-    def export_stage_payload(
-        self,
-        state: DiffusionRequestState,
-        *,
-        source_stage: str,
-        target_stage: str,
-    ) -> DiffusionStagePayload:
-        """Pack the DreamZero carrier into a transportable stage payload.
+    def build_step_batch(self, states, *, cached_batch=None):
+        raise NotImplementedError("DreamZero does not support single-process step batching.")
 
-        Tensors go in the payload's ``tensors`` dict (sanitized to host memory);
-        scalars/metadata go in ``metadata``. The AR-Diffusion KV / scheduler /
+    def build_step_attention_metadata(self, input_batch):
+        return None
+
+    def denoise_step(self, input_batch):
+        raise NotImplementedError("DreamZero runs a whole-request denoise via diffuse(); no per-step denoise_step.")
+
+    def step_scheduler(self, state, noise_pred):
+        raise NotImplementedError("DreamZero advances its scheduler inside diffuse(); no per-step step_scheduler.")
+
+    # -- payload marshalling (StagePayload) ----------------------------------
+
+    def pack_stage_state(self, state: DiffusionRequestState, boundary: StageBoundary) -> StagePayload:
+        """Pack the DreamZero carrier into a transportable :class:`StagePayload`.
+
+        The carrier is entirely model-private, so its tensors go in
+        ``private_tensor_fields`` and its scalars in ``private_scalar_fields``
+        (both sanitized/validated by ``StagePayload.create``). Only ``session_id``
+        is exposed in the public ``scalar_fields`` so the generic transition
+        processor and the AR-Diffusion runner can attach the right KV session
+        without decoding model-private schema. The AR-Diffusion KV / scheduler /
         DreamZeroState are NEVER packed — only stable data.
         """
         carrier = state.extra.get(self._CARRIER_KEY)
         if carrier is None:
             raise StagePayloadError(
-                f"DreamZero export for {state.request_id!r} ({source_stage}->{target_stage}) "
+                f"DreamZero pack for {state.request_id!r} (boundary={boundary}) "
                 f"has no carrier on state.extra[{self._CARRIER_KEY!r}]."
             )
+        tensor_names = self._PAYLOAD_TENSOR_FIELDS.get(boundary)
+        if tensor_names is None:
+            raise StagePayloadError(f"DreamZero has no pack for stage boundary {boundary!r}.")
 
-        if source_stage == ENCODE and target_stage == DENOISE:
-            tensor_fields = (
-                "prompt_embeds",
-                "negative_prompt_embeds",
-                "clip_feas",
-                "ys",
-                "image_latent",
-                "state_features",
-                "embodiment_id",
-                "noise_obs",
-                "noise_action",
-                "state_for_postprocess",
-            )
-        elif source_stage == DENOISE and target_stage == DECODE:
-            tensor_fields = ("video_out", "action_out", "state_for_postprocess")
-        else:
-            raise StagePayloadError(
-                f"DreamZero has no export for transition {source_stage!r}->{target_stage!r}."
-            )
-
-        tensors = {}
-        for name in tensor_fields:
+        private_tensor_fields = {}
+        for name in tensor_names:
             value = getattr(carrier, name, None)
             if value is not None:
-                tensors[name] = value
+                private_tensor_fields[name] = value
 
-        metadata = {
-            "session_id": carrier.session_id,
-            "embodiment_name": carrier.embodiment_name,
-            "transform_embodiment": carrier.transform_embodiment,
-            "reset_reason": carrier.reset_reason,
-            "explicit_reset": carrier.explicit_reset,
-            "do_true_cfg": carrier.do_true_cfg,
-            "current_start_frame": carrier.current_start_frame,
-            "height": carrier.height,
-            "width": carrier.width,
-            "seq_len": carrier.seq_len,
-            "frame_seqlen": carrier.frame_seqlen,
-            "num_inference_steps": carrier.num_inference_steps,
-            "sigma_shift": carrier.sigma_shift,
-        }
-        return DiffusionStagePayload.create(
+        private_scalar_fields = {name: getattr(carrier, name) for name in self._PAYLOAD_SCALAR_FIELDS}
+
+        return StagePayload.create(
             request_id=state.request_id,
-            source_stage=source_stage,
-            target_stage=target_stage,
-            payload_type=f"{source_stage}_to_{target_stage}",
-            tensors=tensors,
-            metadata=metadata,
+            boundary=boundary,
+            scalar_fields={"session_id": carrier.session_id},
+            private_tensor_fields=private_tensor_fields,
+            private_scalar_fields=private_scalar_fields,
         )
 
-    def import_stage_payload(
-        self,
-        payload: DiffusionStagePayload,
-        *,
-        target_stage: str,
-        request: object | None = None,
-    ) -> DiffusionRequestState:
-        """Rebuild a runner-local state (with the DreamZero carrier) from a payload.
+    def unpack_stage_state(self, payload: StagePayload, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Apply a received :class:`StagePayload` to the existing request state.
 
-        Restores the carrier's stable fields; the live AR-Diffusion session is
+        Mutates the runner-created ``state`` in place (the runner already built it
+        from the incoming request, preserving request-level sampling/generator
+        plumbing): rebuilds the DreamZero carrier from the payload's scalar/tensor
+        dicts and stashes it on ``state.extra``. The live AR-Diffusion session is
         acquired separately by the denoise runner via the normal engine mechanism
         (keyed by the transported ``session_id``) — never from the payload.
         """
         payload.validate()
-        meta = payload.metadata
+        meta = payload.private_scalar_fields
         device = get_local_device()
 
         def _to_device(t):
             return t.to(device=device) if isinstance(t, torch.Tensor) else t
 
         carrier = DreamZeroStageCarrier(
-            session_id=str(meta.get("session_id", "default")),
+            session_id=str(payload.scalar_fields.get("session_id", "default")),
             embodiment_name=str(meta.get("embodiment_name", "")),
             transform_embodiment=str(meta.get("transform_embodiment", "")),
             reset_reason=meta.get("reset_reason"),
@@ -1967,16 +1998,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             num_inference_steps=int(meta.get("num_inference_steps", 0)),
             sigma_shift=float(meta.get("sigma_shift", 1.0)),
         )
-        for name, tensor in payload.tensors.items():
+        for name, tensor in payload.private_tensor_fields.items():
             if hasattr(carrier, name):
                 setattr(carrier, name, _to_device(tensor))
 
-        sampling = copy.deepcopy(request.sampling_params) if request is not None else None
-        if sampling is None:
-            from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-            sampling = OmniDiffusionSamplingParams()
-        state = DiffusionRequestState(request_id=payload.request_id, sampling=sampling)
         state.extra[self._CARRIER_KEY] = carrier
         return state
 

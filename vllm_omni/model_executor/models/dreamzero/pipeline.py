@@ -7,10 +7,10 @@ Two registered topologies:
 * ``DREAMZERO_PIPELINE`` (``model_type="dreamzero"``) — the original single
   monolithic diffusion stage. Unchanged; the default for compatibility.
 * ``DREAMZERO_DISAGGREGATED_PIPELINE`` (``model_type="dreamzero_disaggregated"``)
-  — the RFC #4590 three-stage encode -> denoise -> decode topology. All three
-  stages run as native ``StageExecutionType.DIFFUSION`` stages distinguished by
+  — the three-stage encode -> denoise -> decode topology. All three stages run
+  as native ``StageExecutionType.DIFFUSION`` stages distinguished by
   ``model_stage``. The generic diffusion transition processor moves the typed
-  ``DiffusionStagePayload`` between them.
+  ``StagePayload`` between them.
 """
 
 from vllm_omni.config.stage_config import (

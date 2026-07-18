@@ -41,7 +41,10 @@ def stage_roles():
 
 @pytest.fixture(scope="session")
 def stage_payload():
-    return _load_module_by_path("_rfc4590_stage_payload", "diffusion/stage_payload.py")
+    # Register under the REAL dotted name so interface.py's lazy ``_transport()``
+    # (which checks ``sys.modules["vllm_omni.diffusion.stage_payload"]``) resolves
+    # the torch-free leaf without importing the ``vllm_omni`` package (torch).
+    return _load_module_by_path("vllm_omni.diffusion.stage_payload", "diffusion/stage_payload.py")
 
 
 @pytest.fixture(scope="session")
@@ -55,6 +58,9 @@ def diffusion_processor():
 @pytest.fixture(scope="session")
 def interface_mod():
     # interface.py imports torch only under TYPE_CHECKING, so it loads torch-free.
+    # Pre-register the stage_payload leaf under its real dotted name so interface's
+    # lazy ``_transport()`` resolves it without importing the vllm_omni package.
+    _load_module_by_path("vllm_omni.diffusion.stage_payload", "diffusion/stage_payload.py")
     return _load_module_by_path("_rfc4590_interface", "diffusion/models/interface.py")
 
 

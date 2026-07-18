@@ -33,6 +33,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
+    StageBoundary,
+    StagePayload,
     supports_disaggregated_execution,
     supports_step_execution,
 )
@@ -43,13 +45,9 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.stage_payload import (
     STAGE_PAYLOAD_OUTPUT_KEY,
     STAGE_PAYLOAD_PROMPT_KEY,
-    DiffusionStagePayload,
     StagePayloadError,
 )
 from vllm_omni.diffusion.stage_roles import (
-    DECODE,
-    DENOISE,
-    ENCODE,
     EXECUTION_PATH_DECODE,
     EXECUTION_PATH_DENOISE,
     EXECUTION_PATH_ENCODE,
@@ -59,7 +57,6 @@ from vllm_omni.diffusion.stage_roles import (
     normalize_stage_role,
     resolve_execution_path,
 )
-from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
@@ -69,8 +66,6 @@ from vllm_omni.diffusion.worker.utils import (
     clear_pipeline_stage_durations,
     consume_pipeline_stage_durations,
     merge_stage_durations,
-    run_decode_atoms,
-    run_encode_atoms,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -197,8 +192,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "Stage requested disaggregated role "
                 f"{self.model_stage!r} but pipeline "
                 f"{type(self.pipeline).__name__ if self.pipeline else self.od_config.model_class_name} "
-                "does not implement SupportsDisaggregatedDiffusionExecution "
-                "(export_stage_payload / import_stage_payload / required_components_for_stage)."
+                "does not implement the DiffusionV2Atoms disaggregation contract "
+                "(supports_disaggregated_execution flag + pack_stage_state / "
+                "unpack_stage_state / required_components_for_stage)."
             )
 
     def _compile_transformer(self, attr_name: str) -> None:
@@ -278,7 +274,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "DiffusionV2Atoms; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self.supports_step_mode():
@@ -583,7 +579,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         Returns:
             DiffusionOutput with generated results (encode/denoise stages return
-            an intermediate output carrying a DiffusionStagePayload; decode and
+            an intermediate output carrying a StagePayload; decode and
             monolithic stages return the user-visible result).
 
         Note:
@@ -699,8 +695,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Seed the per-request RNG generator exactly like the stepwise path."""
         self._seed_generator(state.sampling)
 
-    def _extract_incoming_payload(self, req: OmniDiffusionRequest) -> DiffusionStagePayload:
-        """Pull the upstream DiffusionStagePayload out of a request prompt.
+    def _extract_incoming_payload(self, req: OmniDiffusionRequest) -> StagePayload:
+        """Pull the upstream StagePayload out of a request prompt.
 
         The generic transition processor places it in the prompt's ``extra``
         sub-dict under :data:`STAGE_PAYLOAD_PROMPT_KEY`. Raise a clear,
@@ -708,7 +704,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         The request crosses the out-of-process (multiproc) stage boundary via
         msgpack, which does not preserve dataclass identity: the payload
-        arrives here as a plain ``dict`` rather than a ``DiffusionStagePayload``
+        arrives here as a plain ``dict`` rather than a ``StagePayload``
         instance. Rehydrate it before validating.
         """
         prompt = req.prompt
@@ -721,15 +717,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if payload is None:
             raise StagePayloadError(
                 f"Request {req.request_id!r} reached stage {self.model_stage!r} without a "
-                f"DiffusionStagePayload in prompt['extra'][{STAGE_PAYLOAD_PROMPT_KEY!r}]; "
+                f"StagePayload in prompt['extra'][{STAGE_PAYLOAD_PROMPT_KEY!r}]; "
                 f"pipeline={type(self.pipeline).__name__}."
             )
-        if isinstance(payload, dict) and not isinstance(payload, DiffusionStagePayload):
-            payload = DiffusionStagePayload.from_dict(payload)
-        if not isinstance(payload, DiffusionStagePayload):
+        if isinstance(payload, dict) and not isinstance(payload, StagePayload):
+            payload = StagePayload.from_dict(payload)
+        if not isinstance(payload, StagePayload):
             raise StagePayloadError(
                 f"Request {req.request_id!r} stage {self.model_stage!r}: payload is "
-                f"{type(payload).__name__}, expected DiffusionStagePayload."
+                f"{type(payload).__name__}, expected StagePayload."
             )
         payload.validate()
         return payload
@@ -737,7 +733,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def _intermediate_output(
         self,
         state: DiffusionRequestState,
-        payload: DiffusionStagePayload,
+        payload: StagePayload,
     ) -> DiffusionOutput:
         """Wrap an exported payload as an intermediate (non-final) stage output.
 
@@ -779,15 +775,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             try:
                 # Run under the diffusion forward context for parity with the
                 # monolithic/denoise/decode paths (encoders may consult it).
+                # Drive the DiffusionV2Atoms encode chain explicitly:
+                # init_state -> check_inputs -> encode -> prepare.
                 with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                     with record_function("pipeline_encode_stage"):
-                        state = run_encode_atoms(self.pipeline, state)
+                        state = self.pipeline.init_state(state)
+                        state = self.pipeline.check_inputs(state)
+                        state = self.pipeline.encode(state)
+                        state = self.pipeline.prepare(state)
                 merge_stage_durations(state, consume_pipeline_stage_durations(self.pipeline))
-                payload = self.pipeline.export_stage_payload(
-                    state,
-                    source_stage=ENCODE,
-                    target_stage=DENOISE,
-                )
+                payload = self.pipeline.pack_stage_state(state, StageBoundary.ENCODE_TO_DIT)
             finally:
                 # Encode owns no persistent state; drop any cache entry eagerly.
                 self.state_cache.pop(req.request_id, None)
@@ -799,22 +796,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def execute_denoise_stage(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """Denoise stage: restore state from payload, run the DiT denoise loop.
 
-        Restores state via ``import_stage_payload`` (which attaches any live
-        session/KV state the target stage owns through the normal engine
-        mechanism — never via the payload), runs the pipeline's denoise, and
-        exports a denoise->decode payload. Never re-runs encode for a
-        payload-origin request.
+        Creates a fresh runner-local state from the request (so request-level
+        sampling/generator/session plumbing is preserved), unpacks the incoming
+        stage payload into it (``unpack_stage_state`` mutates the existing state —
+        it never fabricates one), runs the pipeline's whole-request ``diffuse``
+        atom, and packs a denoise->decode payload. Any live session/KV state the
+        denoise stage owns (AR-Diffusion KV) is attached by the runner subclass
+        before this call — never via the payload. Never re-runs encode.
         """
         self._require_disaggregated_pipeline()
         with self._grad_context():
             is_primary = self._reset_peak_memory()
             clear_pipeline_stage_durations(self.pipeline)
             payload = self._extract_incoming_payload(req)
-            payload.expect_transition(source=ENCODE, target=DENOISE)
-            state = self.pipeline.import_stage_payload(payload, target_stage=DENOISE, request=req)
+            payload.expect_boundary(StageBoundary.ENCODE_TO_DIT)
+            state = self._create_state_from_request(req)
+            state = self.pipeline.unpack_stage_state(payload, state)
             self.state_cache[req.request_id] = state
             try:
-                out_payload = self._run_denoise_forward(state, req)
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    with record_function("pipeline_denoise_stage"):
+                        state = self.pipeline.diffuse(state)
+                out_payload = self.pipeline.pack_stage_state(state, StageBoundary.DIT_TO_DECODE)
                 merge_stage_durations(state, consume_pipeline_stage_durations(self.pipeline))
             finally:
                 # For the first (non-streaming) implementation the whole request
@@ -826,29 +829,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 state.peak_memory_mb = max(state.peak_memory_mb, self._sample_peak_memory_mb())
             logger.debug("denoise stage: request %s payload exported (%s)", req.request_id, out_payload.summary())
             return self._intermediate_output(state, out_payload)
-
-    def _run_denoise_forward(
-        self, state: DiffusionRequestState, req: OmniDiffusionRequest
-    ) -> DiffusionStagePayload:
-        """Run the pipeline's denoise for a restored state and export a payload.
-
-        The base implementation delegates the whole denoise to the pipeline via
-        a single ``run_denoise`` hook when present (the AR-Diffusion / DreamZero
-        path, where the DiT loop and session KV are model-owned), then exports a
-        denoise->decode payload. Pipelines that instead drive the four-method
-        step contract can override this.
-        """
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            with record_function("pipeline_denoise_stage"):
-                run_denoise = getattr(self.pipeline, "run_denoise", None)
-                if callable(run_denoise):
-                    run_denoise(state)
-                else:  # pragma: no cover - requires a non-atom denoise pipeline
-                    raise NotImplementedError(
-                        f"Pipeline {type(self.pipeline).__name__} exposes no run_denoise() for the "
-                        "denoise stage. Implement run_denoise(state) or override _run_denoise_forward()."
-                    )
-        return self.pipeline.export_stage_payload(state, source_stage=DENOISE, target_stage=DECODE)
 
     def execute_decode_stage(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """Decode stage: restore decode state, run VAE/postprocess, return output.
@@ -862,13 +842,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             is_primary = self._reset_peak_memory()
             clear_pipeline_stage_durations(self.pipeline)
             payload = self._extract_incoming_payload(req)
-            payload.expect_transition(source=DENOISE, target=DECODE)
-            state = self.pipeline.import_stage_payload(payload, target_stage=DECODE, request=req)
+            payload.expect_boundary(StageBoundary.DIT_TO_DECODE)
+            state = self._create_state_from_request(req)
+            state = self.pipeline.unpack_stage_state(payload, state)
             self.state_cache[req.request_id] = state
             try:
                 with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                     with record_function("pipeline_decode_stage"):
-                        output = run_decode_atoms(self.pipeline, state)
+                        state = self.pipeline.decode(state)
+                        output = self.pipeline.postprocess(state)
                 if output is None:
                     raise RuntimeError(
                         f"Decode stage produced no output for request {req.request_id!r}."
@@ -910,227 +892,3 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
-
-    def _update_states(
-        self, scheduler_output: DiffusionSchedulerOutput
-    ) -> tuple[list[DiffusionRequestState], list[str]]:
-        """Step-before update: cleanup finished requests and get/create one running state."""
-        for request_id in scheduler_output.finished_req_ids:
-            self.state_cache.pop(request_id, None)
-
-        resolved: list[DiffusionRequestState] = []
-        new_request_ids: list[str] = []
-        try:
-            # process new requests
-            for sched_new_req in scheduler_output.scheduled_new_reqs:
-                request_id = sched_new_req.request_id
-                new_request_ids.append(request_id)
-                if request_id in self.state_cache:
-                    raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
-                new_state = DiffusionRequestState(
-                    request_id=request_id,
-                    sampling=copy.deepcopy(sched_new_req.req.sampling_params),
-                    prompt=sched_new_req.req.prompt,
-                    kv_sender_info=sched_new_req.req.kv_sender_info,
-                )
-                state_req = copy.copy(sched_new_req.req)
-                state_req.sampling_params = new_state.sampling
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    state_req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
-                )
-                self.state_cache[request_id] = new_state
-                resolved.append(new_state)
-
-            # process cached requests
-            for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
-                state = self.state_cache.get(request_id)
-                if state is None:
-                    raise ValueError(f"Missing cached state for request {request_id}.")
-                resolved.append(state)
-        except Exception:
-            for request_id in new_request_ids:
-                self.state_cache.pop(request_id, None)
-            raise
-
-        return resolved, new_request_ids
-
-    def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
-        # process new reqs
-        for state in states:
-            if state.request_id in new_request_ids:
-                # set generator
-                self._seed_generator(state.sampling)
-                clear_pipeline_stage_durations(self.pipeline)
-                # encode
-                self.pipeline.prepare_encode(state)
-                merge_stage_durations(
-                    state,
-                    consume_pipeline_stage_durations(self.pipeline),
-                )
-
-        input_batch = InputBatch.make_batch(
-            states,
-            cached_batch=getattr(self, "input_batch", None),
-        )
-        self.input_batch = input_batch
-        return input_batch
-
-    def _update_states_after(
-        self,
-        states: list[DiffusionRequestState],
-        input_batch: InputBatch,
-        interrupted: bool = False,
-    ):
-        """Step-after update: clear cached state for completed request."""
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
-        else:
-            input_batch.latents = gathered_latents.clone()
-
-        self.input_batch = input_batch
-        scatter_latents(states, input_batch)
-
-        for state in states:
-            if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
-
-    def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
-        model_state = getattr(self, "model_state", None)
-        if model_state is None:
-            return {}
-        prepare_attn = getattr(model_state, "prepare_attn", None)
-        if not callable(prepare_attn):
-            return {}
-        return prepare_attn(input_batch)
-
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Execute one step for one scheduled request and return runner output."""
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not self.supports_step_mode():
-            raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, editing inputs, and
-        # similar features are not supported here yet.
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
-
-        with self._grad_context():
-            had_active_states = bool(self.state_cache)
-            states, new_request_ids = self._update_states(scheduler_output)
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
-                current_omni_platform.reset_peak_memory_stats()
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
-
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-            ):
-                clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
-                for state in states:
-                    merge_stage_durations(
-                        state,
-                        denoise_stage_durations,
-                    )
-
-                runner_output_list = []
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
-                    for state in states:
-                        runner_output_list.append(
-                            RunnerOutput(
-                                request_id=state.request_id,
-                                step_index=state.step_index,
-                                finished=True,
-                                result=DiffusionOutput(error="stepwise denoise interrupted"),
-                            )
-                        )
-
-                else:
-                    offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        try:
-                            self.pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
-                            if self.od_config.streaming_output:
-                                should_decode = req.chunk_denoise_completed
-                            else:
-                                should_decode = req.denoise_completed
-
-                            if should_decode:
-                                clear_pipeline_stage_durations(self.pipeline)
-                                result = self.pipeline.post_decode(req)
-                                if result is not None:
-                                    self._attach_stepwise_metrics(req, result)
-                            else:
-                                result = None
-                            # finished should be computed after post_decode() advanced chunk_index
-                            finished = (
-                                req.request_denoise_completed
-                                if self.od_config.streaming_output
-                                else req.denoise_completed
-                            )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=finished,
-                                    result=result,
-                                )
-                            )
-                            offset = offset + row_num
-                        except Exception as per_req_exc:
-                            offset = offset + row_num
-                            logger.error(
-                                "Stepwise per-request error for %s: %s",
-                                req.request_id,
-                                per_req_exc,
-                                exc_info=True,
-                            )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=True,
-                                    result=DiffusionOutput(error=str(per_req_exc)),
-                                )
-                            )
-
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
-                if is_primary:
-                    batch_peak_memory_mb = self._sample_peak_memory_mb()
-                    states_by_id = {state.request_id: state for state in states}
-                    for state in states:
-                        state.peak_memory_mb = max(state.peak_memory_mb, batch_peak_memory_mb)
-                    for runner_output in runner_output_list:
-                        if runner_output.result is None:
-                            continue
-                        state = states_by_id.get(runner_output.request_id)
-                        if state is None:
-                            continue
-                        runner_output.result.peak_memory_mb = max(
-                            runner_output.result.peak_memory_mb,
-                            state.peak_memory_mb,
-                        )
-
-                self._update_states_after(states, input_batch, pipeline_interrupted)
-
-                return BatchRunnerOutput.from_list(runner_output_list)

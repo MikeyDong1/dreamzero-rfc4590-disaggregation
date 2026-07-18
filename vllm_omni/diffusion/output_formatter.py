@@ -80,7 +80,7 @@ def format_empty_diffusion_outputs(
     """Format a stage output with no user-visible payload (``output.output is None``).
 
     Disaggregated encode/denoise stages intentionally have no image/action
-    output of their own -- they hand off a :class:`DiffusionStagePayload` via
+    output of their own -- they hand off a :class:`StagePayload` via
     ``custom_output`` instead (see ``_intermediate_output`` in
     ``diffusion_model_runner.py``). ``custom_output`` must be forwarded here so
     the generic stage-transition processor can find that payload downstream;

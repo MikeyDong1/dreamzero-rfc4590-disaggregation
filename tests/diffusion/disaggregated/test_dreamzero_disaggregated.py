@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DreamZero disaggregated-execution tests (RFC #4590 §14.5-14.7).
+"""DreamZero disaggregated-execution tests (#4948 DiffusionV2Atoms).
 
 Two tiers, both ``needs_runtime`` (torch + vllm_omni + AR-Diffusion engine):
 
 * ``test_component_spec_*`` and ``test_carrier_*`` need only torch (no GPU / no
-  checkpoint) — they validate the component ownership table and the payload
+  checkpoint) — they validate the component ownership table and the StagePayload
   round-trip of the DreamZero carrier.
 * ``test_numerical_equivalence`` needs the real DreamZero checkpoint + XPU. It is
   additionally gated on the ``DREAMZERO_MODEL_PATH`` env var and skipped when
@@ -39,25 +39,22 @@ pytestmark = pytest.mark.needs_runtime
 # --- capability flags (regression guard) -----------------------------------
 
 
-def test_dreamzero_declares_disaggregated_and_atom_capabilities():
-    """Both capability flags must be present.
+def test_dreamzero_declares_disaggregated_capability():
+    """DreamZero must declare the collapsed DiffusionV2Atoms disaggregation contract.
 
-    The runner's run_encode_atoms / run_decode_atoms shims gate on
-    isinstance(pipeline, SupportsDiffusionAtoms), which for a @runtime_checkable
-    Protocol only passes when the ``supports_diffusion_atoms`` ClassVar is set.
-    Missing it silently falls back to prepare_encode/post_decode (which DreamZero
-    lacks) and crashes the encode/decode stages. Guard both flags here.
+    ``supports_disaggregated_execution(pipeline)`` gates on the explicit
+    ``supports_disaggregated_execution`` flag AND the full ``DiffusionV2Atoms``
+    method surface (a @runtime_checkable Protocol). Missing either would make the
+    runner reject DreamZero's encode/denoise/decode stages at startup. DreamZero
+    stays OFF the single-process step runner (``supports_step_execution`` False).
     """
-    from vllm_omni.diffusion.models.interface import (
-        SupportsDiffusionAtoms,
-        SupportsDisaggregatedDiffusionExecution,
-    )
+    from vllm_omni.diffusion.models.interface import DiffusionV2Atoms
 
     assert DreamZeroPipeline.supports_disaggregated_execution is True
-    assert DreamZeroPipeline.supports_diffusion_atoms is True
-    # Protocol structural checks (methods + flags present on the class).
-    assert issubclass(DreamZeroPipeline, SupportsDiffusionAtoms)
-    assert issubclass(DreamZeroPipeline, SupportsDisaggregatedDiffusionExecution)
+    assert DreamZeroPipeline.supports_step_execution is False
+    # Protocol structural check (all DiffusionV2Atoms methods + the
+    # supports_step_execution ClassVar are present on the class).
+    assert issubclass(DreamZeroPipeline, DiffusionV2Atoms)
 
 
 # --- component ownership (torch only, no checkpoint) -----------------------
@@ -120,35 +117,40 @@ def _make_encode_state_with_carrier():
     return state, carrier
 
 
-def test_export_encode_to_denoise_payload_shape_dtype():
-    # export_stage_payload is an instance method but only touches state.extra;
-    # bind it unbound to avoid constructing the (checkpoint-heavy) pipeline.
+def test_pack_encode_to_dit_payload_shape_dtype():
+    from vllm_omni.diffusion.models.interface import StageBoundary
+
+    # pack_stage_state is an instance method but only touches state.extra + the
+    # field-name ClassVars; bind it unbound to avoid constructing the
+    # (checkpoint-heavy) pipeline.
     state, _ = _make_encode_state_with_carrier()
-    payload = DreamZeroPipeline.export_stage_payload(
-        _StubPipeline(), state, source_stage=ENCODE, target_stage=DENOISE
-    )
+    payload = DreamZeroPipeline.pack_stage_state(_StubPipeline(), state, StageBoundary.ENCODE_TO_DIT)
     payload.validate()
-    assert payload.source_stage == ENCODE and payload.target_stage == DENOISE
-    assert payload.metadata["session_id"] == "sess-A"
-    assert payload.metadata["do_true_cfg"] is True
-    assert payload.metadata["num_inference_steps"] == 4
-    # tensors preserved with dtype/shape
-    assert payload.tensors["prompt_embeds"].shape == (1, 512, 4096)
-    assert payload.tensors["prompt_embeds"].dtype == torch.bfloat16
-    assert payload.tensors["noise_obs"].shape == (1, 4, 16, 22, 40)
-    # KV / scheduler objects never appear
-    assert "scheduler" not in payload.metadata
+    assert payload.boundary is StageBoundary.ENCODE_TO_DIT
+    # session_id is PUBLIC so the transition processor / AR runner can read it.
+    assert payload.scalar_fields["session_id"] == "sess-A"
+    # model-private scalars ride in private_scalar_fields
+    assert payload.private_scalar_fields["do_true_cfg"] is True
+    assert payload.private_scalar_fields["num_inference_steps"] == 4
+    # model-private tensors ride in private_tensor_fields, dtype/shape preserved
+    assert payload.private_tensor_fields["prompt_embeds"].shape == (1, 512, 4096)
+    assert payload.private_tensor_fields["prompt_embeds"].dtype == torch.bfloat16
+    assert payload.private_tensor_fields["noise_obs"].shape == (1, 4, 16, 22, 40)
+    # KV / scheduler objects never appear anywhere
+    assert "scheduler" not in payload.private_scalar_fields
+    assert "session_id" not in payload.private_scalar_fields
 
 
-def test_import_reconstructs_carrier():
+def test_unpack_mutates_state_and_reconstructs_carrier():
+    from vllm_omni.diffusion.models.interface import StageBoundary
+
     state, carrier = _make_encode_state_with_carrier()
-    payload = DreamZeroPipeline.export_stage_payload(
-        _StubPipeline(), state, source_stage=ENCODE, target_stage=DENOISE
-    )
-    restored_state = DreamZeroPipeline.import_stage_payload(
-        _StubPipeline(), payload, target_stage=DENOISE, request=None
-    )
-    restored = restored_state.extra[DreamZeroPipeline._CARRIER_KEY]
+    payload = DreamZeroPipeline.pack_stage_state(_StubPipeline(), state, StageBoundary.ENCODE_TO_DIT)
+    # unpack MUTATES a runner-created target state (does not build a fresh one).
+    target = DiffusionRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams(seed=1))
+    returned = DreamZeroPipeline.unpack_stage_state(_StubPipeline(), payload, target)
+    assert returned is target  # mutate-in-place, not a fresh state
+    restored = target.extra[DreamZeroPipeline._CARRIER_KEY]
     assert restored.session_id == "sess-A"
     assert restored.num_inference_steps == 4
     assert restored.sigma_shift == 5.0
@@ -158,9 +160,11 @@ def test_import_reconstructs_carrier():
 
 
 class _StubPipeline:
-    """Bare object exposing just what export/import touch (no checkpoint load)."""
+    """Bare object exposing just what pack/unpack touch (no checkpoint load)."""
 
     _CARRIER_KEY = DreamZeroPipeline._CARRIER_KEY
+    _PAYLOAD_TENSOR_FIELDS = DreamZeroPipeline._PAYLOAD_TENSOR_FIELDS
+    _PAYLOAD_SCALAR_FIELDS = DreamZeroPipeline._PAYLOAD_SCALAR_FIELDS
 
 
 # --- numerical equivalence (needs GPU + checkpoint) ------------------------
